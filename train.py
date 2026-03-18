@@ -520,6 +520,8 @@ def train_contrastive(
     device="cpu",
     save_output_dir=None,
     save_every_epoch=False,
+    log_every_n_steps=None,
+    log_every_n_examples=50000,
 ):
     model = collm.to(device)
     optimizer = torch.optim.AdamW(model.get_trainable_parameters(), lr=lr)
@@ -527,7 +529,26 @@ def train_contrastive(
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
+        epoch_steps = 0
+        epoch_examples = 0
+        interval_steps = log_every_n_steps
+        if interval_steps is None:
+            interval_steps = max(50, min(1000, len(dataloader) // 200 if len(dataloader) > 0 else 200))
+        if interval_steps <= 0:
+            interval_steps = 50
+
+        print("loss printing interval:", interval_steps)
+
+        next_example_log = log_every_n_examples
+        if next_example_log is None:
+            next_example_log = 0
+        if next_example_log <= 0:
+            next_example_log = int(1e18)
+
         for batch in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False):
+            epoch_steps += 1
+            batch_size = len(batch["modification_text"])
+            epoch_examples += batch_size
             query_texts = [f"Describe the image with modifications- {t}" for t in batch["modification_text"]]
             doc_texts = [f"Describe the image" for _ in batch["modification_text"]]
 
@@ -549,6 +570,19 @@ def train_contrastive(
             optimizer.step()
             total_loss += loss.item()
 
+            if epoch_steps % interval_steps == 0:
+                avg_loss = total_loss / epoch_steps
+                print(
+                    f"[Epoch {epoch + 1}] step {epoch_steps:,} / {len(dataloader) if hasattr(dataloader, '__len__') else '?'} | "
+                    f"examples {epoch_examples:,} | avg loss: {avg_loss:.4f}"
+                )
+            if epoch_examples >= next_example_log:
+                avg_loss = total_loss / max(1, epoch_steps)
+                print(
+                    f"[Epoch {epoch + 1}] processed {epoch_examples:,} examples | step {epoch_steps:,} | avg loss: {avg_loss:.4f}"
+                )
+                next_example_log += log_every_n_examples
+
         if len(dataloader) > 0:
             print(f"Epoch {epoch + 1}: contrastive loss = {total_loss / len(dataloader):.4f}")
 
@@ -569,7 +603,7 @@ def train_contrastive(
 if __name__ == "__main__":
     annotations_file = "./MTCIR/mtcir.jsonl"
     image_dir = "./images"
-    batch_size = 16
+    batch_size = 32
     num_epochs = 1
 
     device = "mps" if torch.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
