@@ -520,7 +520,7 @@ if __name__ == "__main__":
         projection_dim=768,
         projection_dropout=0.0,
         disable_last_layers=4,
-        llm_block_path="language_model.model.layers",
+        llm_block_path="model.language_model.layers",
     )
 
     train_contrastive(
