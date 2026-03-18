@@ -31,17 +31,14 @@ export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 export DIFFUSERS_CACHE="$HF_HOME/diffusers"
 mkdir -p "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE" "$DIFFUSERS_CACHE"
 
-cd /home/anirban/anishc/extractor2
-
-segment_idx=0
-segment_size=128
+cd /home/anirban/anishc/CoLLM-implementation-pytorch
 
 start_ts=$(date +%s)
-echo "Extraction started at for segment index ${segment_idx} and segment size ${segment_size}: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-srun python -m torch.distributed.run --nproc_per_node=2 extract.py --segment-index ${segment_idx} --segment-size ${segment_size}
+srun python train.py
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))
-echo "Extraction finished at: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Training finished at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Total runtime: ${elapsed_sec} seconds"

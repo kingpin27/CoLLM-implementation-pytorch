@@ -30,21 +30,11 @@ class MTCIRDataset(Dataset):
             target_image = self.target_transform(target_image)
 
         modifications = sample["modifications"]
-        if isinstance(modifications, str):
-            # Keep backward-compatible list format if already serialized as JSON string.
-            # Keep raw list style text as-is for downstream tokenization.
-            import json
-            try:
-                parsed = json.loads(modifications)
-                if isinstance(parsed, list):
-                    modifications = parsed
-            except Exception:
-                modifications = [modifications]
 
         return {
             "id": sample["id"],
             "image": source_image,
             "target_image": target_image,
-            "modifications": modifications,
-            "instruction": " ".join(modifications),
+            "modification_text": modifications[0]
         }
+    
