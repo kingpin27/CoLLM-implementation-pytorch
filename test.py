@@ -1,12 +1,9 @@
-from transformers import Qwen3VLForConditionalGeneration
-
-model = Qwen3VLForConditionalGeneration.from_pretrained(
-    "Qwen3-VL-Embedding-2B",
-    torch_dtype="auto",
-    device_map="mps"
-)
-
-print(model)
-
-# layers = model.model.language_model.model.layers
-# print(len(layers))
+import torch
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+import pandas as pd
+import os
+from PIL import Image
+from torch.nn import functional as F
+from transformers import AutoModelForMultimodalLM , AutoProcessor
+from tqdm.auto import tqdm

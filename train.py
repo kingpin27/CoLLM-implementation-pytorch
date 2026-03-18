@@ -50,6 +50,8 @@ class CoLLM(torch.nn.Module):
         trainable_patterns=None,
         remove_output_projection_layer=True,
         output_projection_name=None,
+        disable_last_layers=None,
+        llm_block_path=None,
         projection_dim=None,
         projection_in_features=None,
         projection_dropout=0.0,
@@ -82,6 +84,9 @@ class CoLLM(torch.nn.Module):
                 projection_dtype=projection_dtype,
                 projection_device=projection_device,
             )
+
+        if disable_last_layers is not None and disable_last_layers > 0:
+            self.disable_end_layers(num_layers=disable_last_layers, llm_block_path=llm_block_path)
 
         if freeze_patterns is not None:
             self.freeze_modules(freeze_patterns)
@@ -137,6 +142,51 @@ class CoLLM(torch.nn.Module):
 
     def get_trainable_parameters(self):
         return [param for _, param in self.named_parameters() if param.requires_grad]
+
+    def disable_end_layers(self, num_layers, llm_block_path=None):
+        """
+        Freeze the last `num_layers` transformer layers in the language model.
+        """
+        if num_layers <= 0:
+            return []
+
+        candidates = [
+            llm_block_path,
+            "language_model.model.layers",
+            "language_model.transformer.h",
+            "transformer.h",
+            "model.layers",
+            "model.transformer.h",
+        ]
+        if llm_block_path is not None and llm_block_path not in candidates:
+            candidates = [llm_block_path] + candidates
+
+        layer_block = None
+        for path in candidates:
+            if path is None:
+                continue
+            try:
+                module = self._get_submodule(path)
+            except AttributeError:
+                continue
+            if isinstance(module, torch.nn.ModuleList) and len(module) > 0:
+                layer_block = module
+                break
+
+        if layer_block is None:
+            raise ValueError(
+                "Could not find transformer layers block. "
+                "Pass a valid llm_block_path (for example: 'language_model.model.layers')."
+            )
+
+        num_layers = min(num_layers, len(layer_block))
+        disabled = []
+        for layer_idx in range(len(layer_block) - num_layers, len(layer_block)):
+            for name, param in layer_block[layer_idx].named_parameters():
+                param.requires_grad = False
+                disabled.append(f"{layer_idx}.{name}" )
+
+        return disabled
 
     def _get_submodule(self, module_path):
         module = self.model
@@ -469,6 +519,8 @@ if __name__ == "__main__":
         remove_output_projection_layer=True,
         projection_dim=768,
         projection_dropout=0.0,
+        disable_last_layers=4,
+        llm_block_path="language_model.model.layers",
     )
 
     train_contrastive(
