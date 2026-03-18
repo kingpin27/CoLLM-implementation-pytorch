@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         default="https://www.gstatic.com/generate_204",
         help="Fallback URL to test HTTP connectivity (default: Google's generate_204)",
     )
+    parser.add_argument(
+        "--hf-url",
+        type=str,
+        default="https://huggingface.co/",
+        help="URL to verify Hugging Face accessibility (default: https://huggingface.co/)",
+    )
     return parser.parse_args()
 
 
@@ -62,9 +68,21 @@ def main() -> int:
         ("www.cloudflare.com", 80),
     ]
 
-    online = check_any_host(probes, args.timeout) or has_http_internet(args.url, args.timeout)
-    if online:
+    internet_online = check_any_host(probes, args.timeout) or has_http_internet(args.url, args.timeout)
+    hugging_face_online = has_http_internet(args.hf_url, args.timeout)
+
+    if internet_online:
         print("Internet connection: available")
+    else:
+        print("Internet connection: unavailable")
+
+    if hugging_face_online:
+        print(f"Hugging Face ({args.hf_url}) : accessible")
+    else:
+        print(f"Hugging Face ({args.hf_url}) : blocked or unreachable")
+
+    online = internet_online and hugging_face_online
+    if online:
         return 0
 
     print("Internet connection: unavailable")
