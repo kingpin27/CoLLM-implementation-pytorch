@@ -500,7 +500,7 @@ def train_contrastive(
 if __name__ == "__main__":
     annotations_file = "./MTCIR/mtcir.jsonl"
     image_dir = "./images"
-    batch_size = 32
+    batch_size = 16
     num_epochs = 1
 
     device = "mps" if torch.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
