@@ -381,6 +381,16 @@ def collm_contrastive_collate_fn(batch):
     }
 
 
+def save_collm_checkpoint(collm, processor, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    # Save base Qwen model safely (required for reloading by Auto classes).
+    collm.model.save_pretrained(output_dir)
+    # Save custom projection + training flags from the wrapper.
+    torch.save(collm.state_dict(), os.path.join(output_dir, "collm_wrapper.pt"))
+    # Save processor for full reproducibility.
+    processor.save_pretrained(output_dir)
+
+
 def train_contrastive(
     collm,
     processor,
@@ -389,6 +399,8 @@ def train_contrastive(
     temperature=0.07,
     lr=1e-4,
     device="cpu",
+    save_output_dir=None,
+    save_every_epoch=False,
 ):
     model = collm.to(device)
     optimizer = torch.optim.AdamW(model.get_trainable_parameters(), lr=lr)
@@ -420,6 +432,19 @@ def train_contrastive(
 
         if len(dataloader) > 0:
             print(f"Epoch {epoch + 1}: contrastive loss = {total_loss / len(dataloader):.4f}")
+
+        if save_output_dir is not None:
+            if save_every_epoch:
+                epoch_dir = os.path.join(save_output_dir, f"epoch_{epoch+1}")
+                save_collm_checkpoint(model, processor, epoch_dir)
+            else:
+                # Save once after the final epoch in the default output dir.
+                if epoch == epochs - 1:
+                    save_collm_checkpoint(model, processor, save_output_dir)
+
+    if save_output_dir is not None and not save_every_epoch:
+        # Safety net if dataloader is empty.
+        save_collm_checkpoint(model, processor, save_output_dir)
 
 
 if __name__ == "__main__":
@@ -454,4 +479,6 @@ if __name__ == "__main__":
         temperature=0.07,
         lr=1e-4,
         device=device,
+        save_output_dir="./checkpoints",
+        save_every_epoch=True,
     )
