@@ -52,6 +52,7 @@ class CoLLM(torch.nn.Module):
         output_projection_name=None,
         disable_last_layers=None,
         llm_block_path=None,
+        llm_trainable_last_layers=None,
         projection_dim=None,
         projection_in_features=None,
         projection_dropout=0.0,
@@ -87,6 +88,12 @@ class CoLLM(torch.nn.Module):
 
         if disable_last_layers is not None and disable_last_layers > 0:
             self.disable_end_layers(num_layers=disable_last_layers, llm_block_path=llm_block_path)
+
+        if llm_trainable_last_layers is not None and llm_trainable_last_layers > 0:
+            self.make_last_llm_layers_trainable(
+                num_layers=llm_trainable_last_layers,
+                llm_block_path=llm_block_path,
+            )
 
         if freeze_patterns is not None:
             self.freeze_modules(freeze_patterns)
@@ -145,23 +152,82 @@ class CoLLM(torch.nn.Module):
 
     def disable_end_layers(self, num_layers, llm_block_path=None):
         """
-        Freeze the last `num_layers` transformer layers in the language model.
+        Backward-compatible alias for remove_end_layers().
         """
+        return self.remove_end_layers(num_layers=num_layers, llm_block_path=llm_block_path)
+
+    def remove_end_layers(self, num_layers, llm_block_path=None):
+        """
+        Remove the last `num_layers` transformer layers from the language model.
+        """
+        layer_path, layer_block = self._find_llm_layer_block(llm_block_path)
+        if layer_block is None:
+            raise ValueError(
+                "Could not find transformer layers block. "
+                f"Pass a valid llm_block_path (for example: '{llm_block_path}')."
+            )
+
+        num_layers = min(num_layers, len(layer_block))
         if num_layers <= 0:
             return []
 
+        keep_count = len(layer_block) - num_layers
+        removed_indices = list(range(keep_count, len(layer_block)))
+        self._set_submodule(
+            layer_path,
+            torch.nn.ModuleList(list(layer_block.children())[:keep_count]),
+        )
+        return removed_indices
+
+    def make_last_llm_layers_trainable(self, num_layers, llm_block_path=None):
+        """
+        Freeze all parameters, then unfreeze only the last `num_layers` LLM layers.
+        """
+        self.freeze_all()
+        layer_path, layer_block = self._find_llm_layer_block(llm_block_path)
+        if layer_block is None:
+            raise ValueError(
+                "Could not find transformer layers block. "
+                f"Pass a valid llm_block_path (for example: '{llm_block_path}')."
+            )
+
+        num_layers = max(0, num_layers)
+        if num_layers == 0:
+            return []
+
+        if num_layers >= len(layer_block):
+            for _, param in layer_block.named_parameters():
+                param.requires_grad = True
+            return [f"{layer_path}.{idx}" for idx in range(len(layer_block))]
+
+        start = len(layer_block) - num_layers
+        trainable_layer_indices = []
+        for layer_idx in range(start, len(layer_block)):
+            for name, param in layer_block[layer_idx].named_parameters():
+                param.requires_grad = True
+            trainable_layer_indices.append(f"{layer_path}.{layer_idx}")
+        return trainable_layer_indices
+
+    def _find_llm_layer_block(self, llm_block_path=None):
+        """
+        Find a plausible ModuleList/Sequential containing LLM transformer layers.
+        """
         candidates = [
             llm_block_path,
             "language_model.model.layers",
+            "language_model.model.blocks",
             "language_model.transformer.h",
+            "language_model.transformer.layers",
+            "language_model.blocks",
             "transformer.h",
-            "model.layers",
+            "transformer.layers",
+            "transformer.blocks",
+            "model.language_model.layers",
+            "model.language_model.blocks",
             "model.transformer.h",
+            "model.layers",
+            "model.blocks",
         ]
-        if llm_block_path is not None and llm_block_path not in candidates:
-            candidates = [llm_block_path] + candidates
-
-        layer_block = None
         for path in candidates:
             if path is None:
                 continue
@@ -169,24 +235,27 @@ class CoLLM(torch.nn.Module):
                 module = self._get_submodule(path)
             except AttributeError:
                 continue
-            if isinstance(module, torch.nn.ModuleList) and len(module) > 0:
-                layer_block = module
-                break
+            if isinstance(module, (torch.nn.ModuleList, torch.nn.Sequential)) and len(module) > 0:
+                return path, module
 
-        if layer_block is None:
-            raise ValueError(
-                "Could not find transformer layers block. "
-                "Pass a valid llm_block_path (for example: 'language_model.model.layers')."
-            )
-
-        num_layers = min(num_layers, len(layer_block))
-        disabled = []
-        for layer_idx in range(len(layer_block) - num_layers, len(layer_block)):
-            for name, param in layer_block[layer_idx].named_parameters():
-                param.requires_grad = False
-                disabled.append(f"{layer_idx}.{name}" )
-
-        return disabled
+        # Fallback: pick the largest Layer/Block-like sequential module under model.
+        fallback_path = None
+        fallback_len = 0
+        fallback_module = None
+        for name, module in self.model.named_modules():
+            if name == "":
+                continue
+            if not isinstance(module, (torch.nn.ModuleList, torch.nn.Sequential)):
+                continue
+            if len(module) < 2:
+                continue
+            if ".layer" not in name and ".layers" not in name and ".h" not in name and ".block" not in name:
+                continue
+            if len(module) > fallback_len:
+                fallback_path = name
+                fallback_len = len(module)
+                fallback_module = module
+        return fallback_path, fallback_module
 
     def _get_submodule(self, module_path):
         module = self.model
@@ -520,7 +589,9 @@ if __name__ == "__main__":
         projection_dim=768,
         projection_dropout=0.0,
         disable_last_layers=4,
+        llm_trainable_last_layers=10,
         llm_block_path="model.language_model.layers",
+        llm_trainable_last_layers=10,
     )
 
     train_contrastive(
