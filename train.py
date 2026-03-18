@@ -509,7 +509,7 @@ if __name__ == "__main__":
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=16,
+        num_workers=4,
         collate_fn=collm_contrastive_collate_fn,
     )
 
