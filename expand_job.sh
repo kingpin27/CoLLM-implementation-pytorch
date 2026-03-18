@@ -14,6 +14,6 @@ echo "Node: $(hostname)"
 
 cd /home/anirban/anishc/CoLLM-implementation-pytorch
 
-python scripts/expand_annotation.py -i ./MTCIR/mtcir.jsonl -o ./MTCIR/mtcir_expanded.jsonl
+python3 scripts/expand_annotation.py -i ./MTCIR/mtcir.jsonl -o ./MTCIR/mtcir_expanded.jsonl
 
-python scripts/shuffle_annotations.py -i ./MTCIR/mtcir_expanded.jsonl -o ./MTCIR/mtcir_expanded_shuffled.jsonl --seed 42
+python3 scripts/shuffle_annotations.py -i ./MTCIR/mtcir_expanded.jsonl -o ./MTCIR/mtcir_expanded_shuffled.jsonl --seed 42
