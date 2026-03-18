@@ -17,7 +17,7 @@ nvidia-smi
 module purge
 module load cuda/12.4  
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate SwiftEdit
+conda activate collm
 
 
 # only after first run
