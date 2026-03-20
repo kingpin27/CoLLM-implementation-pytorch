@@ -73,15 +73,17 @@ class CoLLM(torch.nn.Module):
         self.device = "cuda" if torch.cuda.is_available() else ("mps" if torch.mps.is_available() else "cpu")
         self.model_dtype = torch.float16 if self.device == "cuda" else torch.float32
         self._forward_calls = 0
+        self._train_only_projection = True
 
         LOGGER.info("Initializing CoLLM with model=%s on device=%s", self.model_name, self.device)
         self.model = AutoModelForMultimodalLM.from_pretrained(
             self.model_name,
-            torch_dtype=self.model_dtype,
+            dtype=self.model_dtype,
             trust_remote_code=True,
         ).to(self.device)
         if freeze_vision_encoder:
             self.freeze_vision_encoder()
+        self._train_only_projection = not any(p.requires_grad for p in self.model.parameters())
         model_dtype = self.model_dtype
         LOGGER.info("Loaded base model successfully. Model dtype=%s", model_dtype)
 
@@ -158,7 +160,11 @@ class CoLLM(torch.nn.Module):
         """
         self._forward_calls += 1
         inputs = self.make_inputs(processor, pil_image, text, device=self.device)
-        outputs = self.model(**inputs, output_hidden_states=False, return_dict=True)
+        if self._train_only_projection:
+            with torch.no_grad():
+                outputs = self.model(**inputs, output_hidden_states=False, return_dict=True)
+        else:
+            outputs = self.model(**inputs, output_hidden_states=False, return_dict=True)
         hidden = (
             outputs.last_hidden_state
             if hasattr(outputs, "last_hidden_state")
@@ -179,7 +185,7 @@ class CoLLM(torch.nn.Module):
             return projected, inputs.get("attention_mask")
         return projected
 
-    def late_interaction_similarity(self, query_tokens, doc_tokens, query_mask=None, doc_mask=None):
+    def late_interaction_similarity(self, query_tokens, doc_tokens, query_mask=None, doc_mask=None, token_chunk_size=64):
         """
         Compute ColBERT-style late interaction scores for a full BxB batch.
         Returns scores shape [B, B] where score[i, j] is q_i against d_j.
@@ -191,19 +197,24 @@ class CoLLM(torch.nn.Module):
 
         for j in range(B):
             doc_j = d[j : j + 1].expand(B, -1, -1)
-            token_sim = torch.bmm(q, doc_j.transpose(1, 2))
+            qmask = (~query_mask).to(torch.bool) if query_mask is not None else None
+            mask_j = (~doc_mask[j : j + 1]).to(torch.bool) if doc_mask is not None else None
 
-            if doc_mask is not None:
-                mask_j = (~doc_mask[j : j + 1]).to(torch.bool).expand(B, -1)
-                token_sim = token_sim.masked_fill(mask_j[:, None, :], float("-inf"))
+            # Compute in chunks to avoid materializing [B, B, Tq, Td]-scale tensors.
+            for start in range(0, Tq, token_chunk_size):
+                end = min(Tq, start + token_chunk_size)
+                q_chunk = q[:, start:end, :]
+                token_sim = torch.bmm(q_chunk, doc_j.transpose(1, 2))
 
-            token_max = token_sim.max(dim=2).values
+                if mask_j is not None:
+                    token_sim = token_sim.masked_fill(mask_j[:, None, :], float("-inf"))
 
-            if query_mask is not None:
-                qmask = (~query_mask).to(torch.bool)
-                token_max = token_max.masked_fill(qmask, 0.0)
+                token_max = token_sim.max(dim=2).values
 
-            scores[:, j] = token_max.sum(dim=1)
+                if qmask is not None:
+                    token_max = token_max.masked_fill(qmask[:, start:end], 0.0)
+
+                scores[:, j] += token_max.sum(dim=1)
 
         return scores
 
@@ -254,7 +265,9 @@ def main():
     )
 
     LOGGER.info("Initializing optimizer (AdamW, lr=1e-4)")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    LOGGER.info("Optimizer will update %d parameter tensors", len(trainable_params))
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
 
     EPOCHS = 1
     LOGGER.info("Starting training for %d epoch(s)", EPOCHS)
