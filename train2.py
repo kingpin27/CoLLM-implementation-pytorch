@@ -176,20 +176,22 @@ class CoLLM(torch.nn.Module):
         self._forward_calls += 1
         inputs = self.make_inputs(processor, pil_image, text, device=self.device)
         outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
-        hidden = outputs["hidden_states"][-1]
+        hidden = outputs.last_hidden_state
+        if hidden is None and hasattr(outputs, "hidden_states"):
+            hidden = outputs.hidden_states[-1]
         hidden = hidden.to(self.output_linear_projection.weight.dtype)
         projected = self.output_linear_projection(hidden)
 
-        if self._forward_calls <= 3:
-            LOGGER.info(
-                "Forward pass #%d: input_ids=%s, projected=%s",
-                self._forward_calls,
-                tensor_shape(inputs["input_ids"]),
-                tensor_shape(projected),
-            )
+        # if self._forward_calls <= 3:
+        #     LOGGER.info(
+        #         "Forward pass #%d: input_ids=%s, projected=%s",
+        #         self._forward_calls,
+        #         tensor_shape(inputs["input_ids"]),
+        #         tensor_shape(projected),
+        #     )
 
         if return_attention_mask:
-            return projected, inputs.get("attention_mask")
+            return projected, inputs.get("attention_mask").to(torch.bool) if inputs.get("attention_mask") is not None else None
         return projected
 
     def late_interaction_similarity(self, query_tokens, doc_tokens, query_mask=None, doc_mask=None, token_chunk_size=64):
@@ -204,8 +206,8 @@ class CoLLM(torch.nn.Module):
 
         for j in range(B):
             doc_j = d[j : j + 1].expand(B, -1, -1)
-            qmask = (~query_mask).to(torch.bool) if query_mask is not None else None
-            mask_j = (~doc_mask[j : j + 1]).to(torch.bool) if doc_mask is not None else None
+            qmask = ~query_mask if query_mask is not None else None
+            mask_j = ~doc_mask[j : j + 1] if doc_mask is not None else None
 
             # Compute in chunks to avoid materializing [B, B, Tq, Td]-scale tensors.
             for start in range(0, Tq, token_chunk_size):
