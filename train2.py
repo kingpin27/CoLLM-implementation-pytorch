@@ -65,6 +65,7 @@ class CoLLM(torch.nn.Module):
         self,
         model_name="Qwen/Qwen3.5-2B",
         projection_dim=256,
+        freeze_vision_encoder=True,
     ):
         super().__init__()
         self.model_name = model_name
@@ -79,6 +80,8 @@ class CoLLM(torch.nn.Module):
             torch_dtype=self.model_dtype,
             trust_remote_code=True,
         ).to(self.device)
+        if freeze_vision_encoder:
+            self.freeze_vision_encoder()
         model_dtype = self.model_dtype
         LOGGER.info("Loaded base model successfully. Model dtype=%s", model_dtype)
 
@@ -88,6 +91,27 @@ class CoLLM(torch.nn.Module):
             dtype=self.model_dtype,
         )
         LOGGER.info("Initialized projection head with in/out dims: %d -> %d", hidden_dim, self.projection_dim)
+
+    def freeze_vision_encoder(self):
+        """
+        Freeze likely vision-related parameters by module-name heuristics.
+        Keeps projection head and text-only language heads trainable.
+        """
+        vision_keywords = ("vision", "visual", "image", "pixel", "img")
+        frozen = 0
+        total = 0
+
+        for name, param in self.model.named_parameters():
+            total += 1
+            if any(keyword in name.lower() for keyword in vision_keywords):
+                param.requires_grad = False
+                frozen += 1
+
+        LOGGER.info(
+            "freeze_vision_encoder enabled: frozen=%d parameter tensors out of %d matched model params",
+            frozen,
+            total,
+        )
     
     @staticmethod
     def make_inputs(processor, image, text, device="cpu"):
@@ -213,7 +237,7 @@ def main():
     LOGGER.info("Processor loaded")
     
     LOGGER.info("Loading model: %s", model_name)
-    model = CoLLM(model_name=model_name)
+    model = CoLLM(model_name=model_name, freeze_vision_encoder=True)
     LOGGER.info("Model loaded and ready")
 
     LOGGER.info("Creating dataset from %s", './MTCIR/mtcir_expanded_shuffled.jsonl')
