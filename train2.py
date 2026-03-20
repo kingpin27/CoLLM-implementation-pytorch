@@ -1,10 +1,10 @@
 import os
+import json
 import torch
 import logging
 import sys
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-import pandas as pd
 from PIL import Image
 from torch.nn import functional as F
 from transformers import AutoModelForMultimodalLM , AutoProcessor
@@ -25,24 +25,35 @@ def tensor_shape(tensor):
 
 class MTCIRDataset(Dataset):
     def __init__(self, annotations_file, img_dir, transform=None, target_transform=None):
-        examples = pd.read_json(annotations_file, lines=True)
         self.img_dir = img_dir
-        self.ids = examples["id"].tolist()
-        self.source_images = examples["image"].tolist()
-        self.target_images = examples["target_image"].tolist()
-        self.modification_texts = [
-            sample[0] if isinstance(sample, list) and len(sample) > 0 else sample
-            for sample in examples["modifications"].tolist()
-        ]
+        self.annotations_file = annotations_file
+        self.offsets = []
+
+        with open(self.annotations_file, "r", encoding="utf-8") as f:
+            while True:
+                offset = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                if line.strip():
+                    self.offsets.append(offset)
+
         self.transform = transform
         self.target_transform = target_transform
 
     def __len__(self):
-        return len(self.ids)
+        return len(self.offsets)
+
+    def _read_record(self, idx):
+        with open(self.annotations_file, "r", encoding="utf-8") as f:
+            f.seek(self.offsets[idx])
+            line = f.readline()
+        return json.loads(line)
     
     def __getitem__(self, idx):
-        source_path = os.path.join(self.img_dir, self.source_images[idx])
-        target_path = os.path.join(self.img_dir, self.target_images[idx])
+        record = self._read_record(idx)
+        source_path = os.path.join(self.img_dir, record["image"])
+        target_path = os.path.join(self.img_dir, record["target_image"])
 
         source_image = Image.open(source_path).convert("RGB")
         target_image = Image.open(target_path).convert("RGB")
@@ -53,10 +64,14 @@ class MTCIRDataset(Dataset):
             target_image = self.target_transform(target_image)
 
         return {
-            "id": self.ids[idx],
+            "id": record["id"],
             "image": source_image,
             "target_image": target_image,
-            "modification_text": self.modification_texts[idx],
+            "modification_text": (
+                record["modifications"][0]
+                if isinstance(record.get("modifications"), list) and len(record["modifications"]) > 0
+                else record.get("modifications", "")
+            ),
         }
 
 
