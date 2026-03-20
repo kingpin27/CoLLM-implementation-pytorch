@@ -1,8 +1,8 @@
+import os
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 import pandas as pd
-import os
 from PIL import Image
 from torch.nn import functional as F
 from transformers import AutoModelForMultimodalLM , AutoProcessor
@@ -11,19 +11,24 @@ from tqdm.auto import tqdm
 
 class MTCIRDataset(Dataset):
     def __init__(self, annotations_file, img_dir, transform=None, target_transform=None):
-        self.examples = pd.read_json(annotations_file, lines=True)
+        examples = pd.read_json(annotations_file, lines=True)
         self.img_dir = img_dir
+        self.ids = examples["id"].tolist()
+        self.source_images = examples["image"].tolist()
+        self.target_images = examples["target_image"].tolist()
+        self.modification_texts = [
+            sample[0] if isinstance(sample, list) and len(sample) > 0 else sample
+            for sample in examples["modifications"].tolist()
+        ]
         self.transform = transform
         self.target_transform = target_transform
 
     def __len__(self):
-        return len(self.examples)
+        return len(self.ids)
     
     def __getitem__(self, idx):
-        sample = self.examples.iloc[idx]
-
-        source_path = os.path.join(self.img_dir, sample["image"])
-        target_path = os.path.join(self.img_dir, sample["target_image"])
+        source_path = os.path.join(self.img_dir, self.source_images[idx])
+        target_path = os.path.join(self.img_dir, self.target_images[idx])
 
         source_image = Image.open(source_path).convert("RGB")
         target_image = Image.open(target_path).convert("RGB")
@@ -33,13 +38,11 @@ class MTCIRDataset(Dataset):
         if self.target_transform is not None:
             target_image = self.target_transform(target_image)
 
-        modifications = sample["modifications"]
-
         return {
-            "id": sample["id"],
+            "id": self.ids[idx],
             "image": source_image,
             "target_image": target_image,
-            "modification_text": modifications[0]
+            "modification_text": self.modification_texts[idx],
         }
 
 class CoLLM(torch.nn.Module):
@@ -395,26 +398,34 @@ class CoLLM(torch.nn.Module):
 
     @staticmethod
     def late_interaction_score(query_embeddings, query_mask, doc_embeddings, doc_mask):
-        query_embeddings = F.normalize(query_embeddings, dim=-1)
-        doc_embeddings = F.normalize(doc_embeddings, dim=-1)
+        q = F.normalize(query_embeddings, dim=-1)
+        d = F.normalize(doc_embeddings, dim=-1)
 
-        batch_size = query_embeddings.size(0)
-        scores = torch.empty((batch_size, batch_size), device=query_embeddings.device, dtype=query_embeddings.dtype)
+        q_mask_bool = query_mask.to(torch.bool) if query_mask is not None else None
+        d_mask_bool = doc_mask.to(torch.bool) if doc_mask is not None else None
 
-        for i in range(batch_size):
-            q_len = query_embeddings.size(1) if query_mask is None else int(query_mask[i].sum().item())
-            q = query_embeddings[i, :q_len]
+        # [B, B, Q, D]
+        sim = torch.einsum("bqd, jkd -> bjqk", q, d)
 
-            for j in range(batch_size):
-                d_len = doc_embeddings.size(1) if doc_mask is None else int(doc_mask[j].sum().item())
-                d = doc_embeddings[j, :d_len]
+        if d_mask_bool is not None:
+            sim = sim.masked_fill(~(d_mask_bool[None, :, None, :].to(sim.device)), -float("inf"))
+        if q_mask_bool is not None:
+            q_token_mask = q_mask_bool[:, None, :, None]
+            sim = sim.masked_fill(~(q_token_mask.to(sim.device)), -float("inf"))
 
-                if q_len == 0 or d_len == 0:
-                    scores[i, j] = 0.0
-                    continue
+        max_scores = sim.max(dim=-1).values
+        if q_mask_bool is not None:
+            q_token_mask = q_mask_bool[:, None, :]
+            max_scores = max_scores.masked_fill(~q_token_mask, 0.0)
 
-                sim = q @ d.t()
-                scores[i, j] = sim.max(dim=1).values.sum()
+        scores = max_scores.sum(dim=-1)
+
+        if q_mask_bool is not None:
+            zero_query = q_mask_bool.sum(dim=1) == 0
+            scores = scores.masked_fill(zero_query[:, None], 0.0)
+        if d_mask_bool is not None:
+            zero_doc = d_mask_bool.sum(dim=1) == 0
+            scores = scores.masked_fill(~zero_doc[None, :], 0.0)
 
         return scores
 
@@ -524,7 +535,11 @@ def train_contrastive(
     log_every_n_examples=50000,
 ):
     model = collm.to(device)
+    use_cuda = device.startswith("cuda")
+    use_mps = device.startswith("mps")
     optimizer = torch.optim.AdamW(model.get_trainable_parameters(), lr=lr)
+    scaler = torch.amp.GradScaler(enabled=use_cuda, device="cuda")
+    torch.set_float32_matmul_precision("high")
 
     model.train()
     for epoch in range(epochs):
@@ -558,16 +573,22 @@ def train_contrastive(
             query_inputs = {key: value.to(device) for key, value in query_inputs.items()}
             doc_inputs = {key: value.to(device) for key, value in doc_inputs.items()}
 
-            q_embeddings, q_mask = model.encode(query_inputs)
-            d_embeddings, d_mask = model.encode(doc_inputs)
-
-            logits = CoLLM.late_interaction_score(q_embeddings, q_mask, d_embeddings, d_mask) / temperature
-            targets = torch.arange(logits.size(0), device=device)
-            loss = F.cross_entropy(logits, targets)
+            autocast_device = "cuda" if use_cuda else ("mps" if use_mps else "cpu")
+            with torch.autocast(autocast_device, enabled=(use_cuda or use_mps)):
+                q_embeddings, q_mask = model.encode(query_inputs)
+                d_embeddings, d_mask = model.encode(doc_inputs)
+                logits = CoLLM.late_interaction_score(q_embeddings, q_mask, d_embeddings, d_mask) / temperature
+                targets = torch.arange(logits.size(0), device=device)
+                loss = F.cross_entropy(logits, targets)
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if use_cuda:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             total_loss += loss.item()
 
             if epoch_steps % interval_steps == 0:
@@ -607,13 +628,26 @@ if __name__ == "__main__":
     num_epochs = 1
 
     device = "mps" if torch.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    num_workers = min(8, max(2, (os.cpu_count() or 4) - 2))
     train_dataset = MTCIRDataset(annotations_file=annotations_file, img_dir=image_dir)
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "shuffle": True,
+        "collate_fn": collm_contrastive_collate_fn,
+    }
+    if num_workers > 0:
+        loader_kwargs.update(
+            {
+                "pin_memory": True,
+                "persistent_workers": True,
+                "prefetch_factor": 4,
+            }
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=collm_contrastive_collate_fn,
+        **loader_kwargs,
     )
 
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-2B", trust_remote_code=True)
