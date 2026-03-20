@@ -622,7 +622,7 @@ def train_contrastive(
 
 
 if __name__ == "__main__":
-    annotations_file = "./MTCIR/mtcir.jsonl"
+    annotations_file = "./MTCIR/mtcir_expanded_shuffled.jsonl"
     image_dir = "./images"
     batch_size = 32
     num_epochs = 1
