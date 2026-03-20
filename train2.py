@@ -180,11 +180,19 @@ class CoLLM(torch.nn.Module):
                 outputs = self.model(**inputs, output_hidden_states=False, return_dict=True)
         else:
             outputs = self.model(**inputs, output_hidden_states=False, return_dict=True)
-        hidden = (
-            outputs.last_hidden_state
-            if hasattr(outputs, "last_hidden_state")
-            else outputs.hidden_states[-1]
-        )
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            hidden = outputs.last_hidden_state
+        elif hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+            hidden = outputs.hidden_states[-1]
+        elif isinstance(outputs, tuple) and len(outputs) > 0 and torch.is_tensor(outputs[0]) and outputs[0].dim() == 3:
+            hidden = outputs[0]
+        elif isinstance(outputs, tuple) and len(outputs) > 1 and torch.is_tensor(outputs[1]) and outputs[1].dim() == 3:
+            hidden = outputs[1]
+        else:
+            raise AttributeError(
+                "Model outputs do not contain a recoverable token-level tensor "
+                "(expected last_hidden_state/hidden_states or a 3D tensor in tuple output)."
+            )
         hidden = hidden.to(self.output_linear_projection.weight.dtype)
         projected = self.output_linear_projection(hidden)
 
