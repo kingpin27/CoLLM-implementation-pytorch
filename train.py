@@ -2,8 +2,11 @@ import os
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import pandas as pd
 from PIL import Image
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import functional as F
 from transformers import AutoModelForMultimodalLM , AutoProcessor
 from tqdm.auto import tqdm
@@ -481,6 +484,43 @@ class CoLLM(torch.nn.Module):
         return self.projection
 
 
+def setup_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return False, 0, 1, 0
+
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is required for multi-GPU training.")
+
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(
+        os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count() if torch.cuda.is_available() else 0)
+    )
+
+    if not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    return True, rank, world_size, local_rank
+
+
+def all_gather_if_ddp(tensor, enabled=False):
+    if not enabled or not dist.is_available() or not dist.is_initialized():
+        return tensor
+
+    world_size = dist.get_world_size()
+    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor)
+    return torch.cat(gathered, dim=0)
+
+
+def is_main_process(rank=0):
+    return rank == 0
+
+
 def build_contrastive_inputs(processor, images, texts):
     messages = []
     for text in texts:
@@ -533,16 +573,29 @@ def train_contrastive(
     save_every_epoch=False,
     log_every_n_steps=None,
     log_every_n_examples=50000,
+    use_ddp=False,
+    rank=0,
+    local_rank=0,
 ):
-    model = collm.to(device)
-    use_cuda = device.startswith("cuda")
-    use_mps = device.startswith("mps")
-    optimizer = torch.optim.AdamW(model.get_trainable_parameters(), lr=lr)
+    torch_device = torch.device(device)
+    model = collm.to(torch_device)
+    trainable_params = model.get_trainable_parameters()
+    use_cuda = torch_device.type == "cuda"
+    use_mps = torch_device.type == "mps"
+    if use_cuda and use_ddp and not isinstance(model, DDP):
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        trainable_params = model.module.get_trainable_parameters()
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
     scaler = torch.amp.GradScaler(enabled=use_cuda, device="cuda")
     torch.set_float32_matmul_precision("high")
 
     model.train()
     for epoch in range(epochs):
+        if use_ddp and isinstance(dataloader.sampler, DistributedSampler):
+            dataloader.sampler.set_epoch(epoch)
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False) if (not use_ddp or is_main_process(rank)) else dataloader
+
         total_loss = 0.0
         epoch_steps = 0
         epoch_examples = 0
@@ -560,7 +613,7 @@ def train_contrastive(
         if next_example_log <= 0:
             next_example_log = int(1e18)
 
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False):
+        for batch in progress_bar:
             epoch_steps += 1
             batch_size = len(batch["modification_text"])
             epoch_examples += batch_size
@@ -575,10 +628,25 @@ def train_contrastive(
 
             autocast_device = "cuda" if use_cuda else ("mps" if use_mps else "cpu")
             with torch.autocast(autocast_device, enabled=(use_cuda or use_mps)):
-                q_embeddings, q_mask = model.encode(query_inputs)
-                d_embeddings, d_mask = model.encode(doc_inputs)
-                logits = CoLLM.late_interaction_score(q_embeddings, q_mask, d_embeddings, d_mask) / temperature
-                targets = torch.arange(logits.size(0), device=device)
+                q_embeddings, q_mask = model.module.encode(query_inputs) if isinstance(model, DDP) else model.encode(query_inputs)
+                d_embeddings, d_mask = model.module.encode(doc_inputs) if isinstance(model, DDP) else model.encode(doc_inputs)
+
+                if use_ddp and dist.is_initialized():
+                    gathered_q = all_gather_if_ddp(q_embeddings, enabled=True)
+                    d_embeddings = all_gather_if_ddp(d_embeddings, enabled=True)
+                    gathered_q_mask = all_gather_if_ddp(q_mask, enabled=True) if q_mask is not None else None
+                    d_mask = all_gather_if_ddp(d_mask, enabled=True) if d_mask is not None else None
+                    world_size = dist.get_world_size()
+                    local_bs = gathered_q.shape[0] // world_size
+                    rank_offset = rank * local_bs
+                    q_embeddings = gathered_q[rank_offset : rank_offset + local_bs]
+                    q_mask = gathered_q_mask[rank_offset : rank_offset + local_bs] if gathered_q_mask is not None else None
+                    targets = torch.arange(local_bs, device=device) + rank * local_bs
+                    logits = CoLLM.late_interaction_score(q_embeddings, q_mask, d_embeddings, d_mask) / temperature
+                else:
+                    logits = CoLLM.late_interaction_score(q_embeddings, q_mask, d_embeddings, d_mask) / temperature
+                    targets = torch.arange(logits.size(0), device=device)
+
                 loss = F.cross_entropy(logits, targets)
 
             optimizer.zero_grad()
@@ -593,48 +661,82 @@ def train_contrastive(
 
             if epoch_steps % interval_steps == 0:
                 avg_loss = total_loss / epoch_steps
-                print(
-                    f"[Epoch {epoch + 1}] step {epoch_steps:,} / {len(dataloader) if hasattr(dataloader, '__len__') else '?'} | "
-                    f"examples {epoch_examples:,} | avg loss: {avg_loss:.4f}"
-                )
+                if not use_ddp or is_main_process(rank):
+                    print(
+                        f"[Epoch {epoch + 1}] step {epoch_steps:,} / {len(dataloader) if hasattr(dataloader, '__len__') else '?'} | "
+                        f"examples {epoch_examples:,} | avg loss: {avg_loss:.4f}"
+                    )
             if epoch_examples >= next_example_log:
                 avg_loss = total_loss / max(1, epoch_steps)
-                print(
-                    f"[Epoch {epoch + 1}] processed {epoch_examples:,} examples | step {epoch_steps:,} | avg loss: {avg_loss:.4f}"
-                )
+                if not use_ddp or is_main_process(rank):
+                    print(
+                        f"[Epoch {epoch + 1}] processed {epoch_examples:,} examples | step {epoch_steps:,} | avg loss: {avg_loss:.4f}"
+                    )
                 next_example_log += log_every_n_examples
 
         if len(dataloader) > 0:
-            print(f"Epoch {epoch + 1}: contrastive loss = {total_loss / len(dataloader):.4f}")
+            if not use_ddp or is_main_process(rank):
+                print(f"Epoch {epoch + 1}: contrastive loss = {total_loss / len(dataloader):.4f}")
 
         if save_output_dir is not None:
+            saving_model = model.module if isinstance(model, DDP) else model
             if save_every_epoch:
                 epoch_dir = os.path.join(save_output_dir, f"epoch_{epoch+1}")
-                save_collm_checkpoint(model, processor, epoch_dir)
+                if not use_ddp or is_main_process(rank):
+                    save_collm_checkpoint(saving_model, processor, epoch_dir)
             else:
                 # Save once after the final epoch in the default output dir.
                 if epoch == epochs - 1:
-                    save_collm_checkpoint(model, processor, save_output_dir)
+                    if not use_ddp or is_main_process(rank):
+                        save_collm_checkpoint(saving_model, processor, save_output_dir)
 
     if save_output_dir is not None and not save_every_epoch:
         # Safety net if dataloader is empty.
-        save_collm_checkpoint(model, processor, save_output_dir)
+        if not use_ddp or is_main_process(rank):
+            saving_model = model.module if isinstance(model, DDP) else model
+            save_collm_checkpoint(saving_model, processor, save_output_dir)
 
 
 if __name__ == "__main__":
+    use_ddp, rank, world_size, local_rank = setup_distributed()
     annotations_file = "./MTCIR/mtcir_expanded_shuffled.jsonl"
     image_dir = "./images"
     batch_size = 32
     num_epochs = 1
 
-    device = "mps" if torch.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    if use_ddp and torch.cuda.is_available():
+        device = f"cuda:{local_rank}"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    elif torch.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     num_workers = min(8, max(2, (os.cpu_count() or 4) - 2))
     train_dataset = MTCIRDataset(annotations_file=annotations_file, img_dir=image_dir)
+
+    sampler = None
+    if use_ddp and world_size > 1:
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+
     loader_kwargs = {
+        "batch_size": batch_size,
         "num_workers": num_workers,
-        "shuffle": True,
         "collate_fn": collm_contrastive_collate_fn,
     }
+    if sampler is None:
+        loader_kwargs["shuffle"] = True
+        loader_kwargs["drop_last"] = False
+    else:
+        loader_kwargs["sampler"] = sampler
+        loader_kwargs["drop_last"] = True
+
     if num_workers > 0:
         loader_kwargs.update(
             {
@@ -644,11 +746,7 @@ if __name__ == "__main__":
             }
         )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        **loader_kwargs,
-    )
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
 
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-2B", trust_remote_code=True)
     model = CoLLM(
@@ -671,4 +769,11 @@ if __name__ == "__main__":
         device=device,
         save_output_dir="./checkpoints",
         save_every_epoch=True,
+        use_ddp=use_ddp,
+        rank=rank,
+        local_rank=local_rank,
     )
+
+    if use_ddp and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()

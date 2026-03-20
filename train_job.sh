@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --time=48:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
@@ -34,9 +34,10 @@ mkdir -p "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE" "$DIFFUSERS_CACHE"
 cd /home/anirban/anishc/CoLLM-implementation-pytorch
 
 start_ts=$(date +%s)
-echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Training started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-srun python train.py
+NUM_GPUS=${SLURM_GPUS_ON_NODE:-2}
+torchrun --standalone --nproc_per_node=$NUM_GPUS train.py
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))
