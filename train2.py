@@ -176,9 +176,7 @@ class CoLLM(torch.nn.Module):
         self._forward_calls += 1
         inputs = self.make_inputs(processor, pil_image, text, device=self.device)
         outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
-        hidden = outputs.last_hidden_state
-        if hidden is None and hasattr(outputs, "hidden_states"):
-            hidden = outputs.hidden_states[-1]
+        hidden = outputs.hidden_states[-1]
         hidden = hidden.to(self.output_linear_projection.weight.dtype)
         projected = self.output_linear_projection(hidden)
 
