@@ -1,6 +1,7 @@
 import os
 import torch
 import logging
+import sys
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 import pandas as pd
@@ -12,6 +13,8 @@ from tqdm.auto import tqdm
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
 )
 LOGGER = logging.getLogger("train2")
 
@@ -67,22 +70,22 @@ class CoLLM(torch.nn.Module):
         self.model_name = model_name
         self.projection_dim = projection_dim
         self.device = "cuda" if torch.cuda.is_available() else ("mps" if torch.mps.is_available() else "cpu")
+        self.model_dtype = torch.float16 if self.device == "cuda" else torch.float32
         self._forward_calls = 0
 
         LOGGER.info("Initializing CoLLM with model=%s on device=%s", self.model_name, self.device)
         self.model = AutoModelForMultimodalLM.from_pretrained(
             self.model_name,
-            torch_dtype="auto",
-            device_map="auto",
-            trust_remote_code=True
+            torch_dtype=self.model_dtype,
+            trust_remote_code=True,
         ).to(self.device)
-        model_dtype = next(self.model.parameters()).dtype
+        model_dtype = self.model_dtype
         LOGGER.info("Loaded base model successfully. Model dtype=%s", model_dtype)
 
         hidden_dim = getattr(self.model.config, "hidden_size", 1024)
         self.output_linear_projection = torch.nn.Linear(hidden_dim, self.projection_dim).to(
             self.device,
-            dtype=model_dtype,
+            dtype=self.model_dtype,
         )
         LOGGER.info("Initialized projection head with in/out dims: %d -> %d", hidden_dim, self.projection_dim)
     
@@ -131,8 +134,12 @@ class CoLLM(torch.nn.Module):
         """
         self._forward_calls += 1
         inputs = self.make_inputs(processor, pil_image, text, device=self.device)
-        outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
-        hidden = outputs.hidden_states[-1]
+        outputs = self.model(**inputs, output_hidden_states=False, return_dict=True)
+        hidden = (
+            outputs.last_hidden_state
+            if hasattr(outputs, "last_hidden_state")
+            else outputs.hidden_states[-1]
+        )
         hidden = hidden.to(self.output_linear_projection.weight.dtype)
         projected = self.output_linear_projection(hidden)
 
@@ -155,24 +162,26 @@ class CoLLM(torch.nn.Module):
         """
         q = F.normalize(query_tokens, dim=-1)
         d = F.normalize(doc_tokens, dim=-1)
+        B, Tq, _ = q.shape
+        scores = torch.zeros((B, B), device=q.device, dtype=q.dtype)
 
-        q_exp = q[:, None, :, :]
-        d_exp = d[None, :, :, :]
+        for j in range(B):
+            doc_j = d[j : j + 1].expand(B, -1, -1)
+            token_sim = torch.bmm(q, doc_j.transpose(1, 2))
 
-        # [B, B, Tq, Td]
-        token_sim = torch.matmul(q_exp, d_exp.transpose(-1, -2))
+            if doc_mask is not None:
+                mask_j = (~doc_mask[j : j + 1]).to(torch.bool).expand(B, -1)
+                token_sim = token_sim.masked_fill(mask_j[:, None, :], float("-inf"))
 
-        if doc_mask is not None:
-            dmask = (~doc_mask[None, :, None, :]).to(torch.bool)
-            token_sim = token_sim.masked_fill(dmask, float("-inf"))
+            token_max = token_sim.max(dim=2).values
 
-        token_max = token_sim.max(dim=3).values  # [B, B, Tq]
+            if query_mask is not None:
+                qmask = (~query_mask).to(torch.bool)
+                token_max = token_max.masked_fill(qmask, 0.0)
 
-        if query_mask is not None:
-            qmask = (~query_mask[:, None, :]).to(torch.bool)
-            token_max = token_max.masked_fill(qmask, 0.0)
+            scores[:, j] = token_max.sum(dim=1)
 
-        return token_max.sum(dim=2)
+        return scores
 
     def infonce_loss(self, query_tokens, doc_tokens, temperature=0.05, query_mask=None, doc_mask=None):
         """
@@ -196,7 +205,7 @@ def collm_contrastive_collate_fn(batch):
 def main():
     processor_name = "Qwen/Qwen3.5-0.8B"
     model_name = "Qwen/Qwen3.5-0.8B"
-    batch_size = 32
+    batch_size = 8
     num_workers = 4
 
     LOGGER.info("Loading processor: %s", processor_name)
@@ -228,7 +237,12 @@ def main():
 
     for epoch in range(EPOCHS):
         LOGGER.info("Running epoch %d/%d", epoch + 1, EPOCHS)
-        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}", leave=False)
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{EPOCHS}",
+            leave=False,
+            file=sys.stdout,
+        )
         for batch_idx, batch in enumerate(progress):
             model.train()
             optimizer.zero_grad()
