@@ -175,24 +175,8 @@ class CoLLM(torch.nn.Module):
         """
         self._forward_calls += 1
         inputs = self.make_inputs(processor, pil_image, text, device=self.device)
-        if self._train_only_projection:
-            with torch.no_grad():
-                outputs = self.model(**inputs, output_hidden_states=False, return_dict=True)
-        else:
-            outputs = self.model(**inputs, output_hidden_states=False, return_dict=True)
-        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-            hidden = outputs.last_hidden_state
-        elif hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-            hidden = outputs.hidden_states[-1]
-        elif isinstance(outputs, tuple) and len(outputs) > 0 and torch.is_tensor(outputs[0]) and outputs[0].dim() == 3:
-            hidden = outputs[0]
-        elif isinstance(outputs, tuple) and len(outputs) > 1 and torch.is_tensor(outputs[1]) and outputs[1].dim() == 3:
-            hidden = outputs[1]
-        else:
-            raise AttributeError(
-                "Model outputs do not contain a recoverable token-level tensor "
-                "(expected last_hidden_state/hidden_states or a 3D tensor in tuple output)."
-            )
+        outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
+        hidden = outputs["hidden_states"][-1]
         hidden = hidden.to(self.output_linear_projection.weight.dtype)
         projected = self.output_linear_projection(hidden)
 
