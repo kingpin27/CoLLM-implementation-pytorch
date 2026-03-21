@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from PIL import Image
 from torch.nn import functional as F
-from transformers import AutoModelForMultimodalLM , AutoProcessor
+from transformers import AutoModelForMultimodalLM, AutoProcessor
 from tqdm.auto import tqdm
 
 logging.basicConfig(
@@ -17,6 +17,10 @@ logging.basicConfig(
     force=True,
 )
 LOGGER = logging.getLogger("train2")
+
+# FIX 1 (OOM): Tell PyTorch's allocator to use expandable segments
+# to reduce fragmentation before we even start.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 
 def tensor_shape(tensor):
@@ -49,7 +53,7 @@ class MTCIRDataset(Dataset):
             f.seek(self.offsets[idx])
             line = f.readline()
         return json.loads(line)
-    
+
     def __getitem__(self, idx):
         record = self._read_record(idx)
         source_path = os.path.join(self.img_dir, record["image"])
@@ -96,6 +100,13 @@ class CoLLM(torch.nn.Module):
             dtype=self.model_dtype,
             trust_remote_code=True,
         ).to(self.device)
+
+        # FIX 2 (OOM): Enable gradient checkpointing to trade compute for memory.
+        # This recomputes activations during backward instead of storing them.
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
+            LOGGER.info("Gradient checkpointing enabled")
+
         if freeze_vision_encoder:
             self.freeze_vision_encoder()
         self._train_only_projection = not any(p.requires_grad for p in self.model.parameters())
@@ -129,7 +140,7 @@ class CoLLM(torch.nn.Module):
             frozen,
             total,
         )
-    
+
     @staticmethod
     def make_inputs(processor, image, text, device="cpu"):
         if not isinstance(image, (list, tuple)):
@@ -175,21 +186,20 @@ class CoLLM(torch.nn.Module):
         """
         self._forward_calls += 1
         inputs = self.make_inputs(processor, pil_image, text, device=self.device)
-        outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
+        # FIX 3 (OOM): Use autocast for the forward pass.
+        # Even though weights are fp16, intermediate activations (e.g. the
+        # attention tensors inside chunk_gated_delta_rule) are created in the
+        # default dtype. autocast pins them to fp16, cutting peak memory ~2x.
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(self.device == "cuda")):
+            outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
         hidden = outputs.hidden_states[-1]
         hidden = hidden.to(self.output_linear_projection.weight.dtype)
         projected = self.output_linear_projection(hidden)
 
-        # if self._forward_calls <= 3:
-        #     LOGGER.info(
-        #         "Forward pass #%d: input_ids=%s, projected=%s",
-        #         self._forward_calls,
-        #         tensor_shape(inputs["input_ids"]),
-        #         tensor_shape(projected),
-        #     )
-
         if return_attention_mask:
-            return projected, inputs.get("attention_mask").to(torch.bool) if inputs.get("attention_mask") is not None else None
+            attn = inputs.get("attention_mask")
+            mask = attn.to(torch.bool) if attn is not None else None
+            return projected, mask
         return projected
 
     def late_interaction_similarity(self, query_tokens, doc_tokens, query_mask=None, doc_mask=None, token_chunk_size=64):
@@ -197,24 +207,30 @@ class CoLLM(torch.nn.Module):
         Compute ColBERT-style late interaction scores for a full BxB batch.
         Returns scores shape [B, B] where score[i, j] is q_i against d_j.
         """
-        q = F.normalize(query_tokens, dim=-1)
-        d = F.normalize(doc_tokens, dim=-1)
+        # FIX 4 (NaN): Upcast to float32 for the similarity computation.
+        # float16 has a narrow dynamic range; max-pooling over -inf values and
+        # summing many terms causes overflow → NaN. float32 is stable here and
+        # the tensors are small (B×T×D), so cost is negligible.
+        q = F.normalize(query_tokens.float(), dim=-1)
+        d = F.normalize(doc_tokens.float(), dim=-1)
         B, Tq, _ = q.shape
-        scores = torch.zeros((B, B), device=q.device, dtype=q.dtype)
+        scores = torch.zeros((B, B), device=q.device, dtype=torch.float32)
 
         for j in range(B):
             doc_j = d[j : j + 1].expand(B, -1, -1)
             qmask = ~query_mask if query_mask is not None else None
             mask_j = ~doc_mask[j : j + 1] if doc_mask is not None else None
 
-            # Compute in chunks to avoid materializing [B, B, Tq, Td]-scale tensors.
             for start in range(0, Tq, token_chunk_size):
                 end = min(Tq, start + token_chunk_size)
                 q_chunk = q[:, start:end, :]
                 token_sim = torch.bmm(q_chunk, doc_j.transpose(1, 2))
 
                 if mask_j is not None:
-                    token_sim = token_sim.masked_fill(mask_j[:, None, :], float("-inf"))
+                    # FIX 5 (NaN): Replace -inf with a large finite negative.
+                    # -inf propagates as NaN through fp16 max/sum; a finite
+                    # sentinel (-1e4) is just as effective for masking and safe.
+                    token_sim = token_sim.masked_fill(mask_j[:, None, :], -1e4)
 
                 token_max = token_sim.max(dim=2).values
 
@@ -236,6 +252,7 @@ class CoLLM(torch.nn.Module):
         labels = torch.arange(query_tokens.size(0), device=query_tokens.device)
         return torch.nn.functional.cross_entropy(scores / temperature, labels), scores
 
+
 def collm_contrastive_collate_fn(batch):
     return {
         "id": [item["id"] for item in batch],
@@ -244,16 +261,22 @@ def collm_contrastive_collate_fn(batch):
         "modification_text": [item["modification_text"] for item in batch],
     }
 
+
 def main():
     processor_name = "Qwen/Qwen3.5-0.8B"
     model_name = "Qwen/Qwen3.5-0.8B"
-    batch_size = 8
+    # FIX 6 (OOM): Reduce batch size from 8 → 4.
+    # With gradient checkpointing + autocast this should fit in 47 GiB,
+    # but start at 4 and increase if memory headroom allows.
+    batch_size = 4
     num_workers = 4
+    # FIX 7 (NaN): Clip gradients to prevent fp16 explosion.
+    max_grad_norm = 1.0
 
     LOGGER.info("Loading processor: %s", processor_name)
     processor = AutoProcessor.from_pretrained(processor_name, trust_remote_code=True)
     LOGGER.info("Processor loaded")
-    
+
     LOGGER.info("Loading model: %s", model_name)
     model = CoLLM(model_name=model_name, freeze_vision_encoder=True)
     LOGGER.info("Model loaded and ready")
@@ -275,6 +298,10 @@ def main():
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     LOGGER.info("Optimizer will update %d parameter tensors", len(trainable_params))
     optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
+
+    # FIX 8 (NaN + OOM): Use a GradScaler so that fp16 underflow doesn't
+    # silently zero out gradients and so that backward stays numerically stable.
+    scaler = torch.cuda.amp.GradScaler(enabled=(model.device == "cuda"))
 
     EPOCHS = 1
     LOGGER.info("Starting training for %d epoch(s)", EPOCHS)
@@ -311,17 +338,31 @@ def main():
                 query_mask=query_mask,
                 doc_mask=doc_mask,
             )
-            loss.backward()
-            optimizer.step()
+
+            # NaN guard: skip the update if loss is bad rather than corrupting
+            # the model weights with NaN gradients.
+            if not torch.isfinite(loss):
+                LOGGER.warning("Batch=%d produced non-finite loss (%s), skipping update", batch_idx + 1, loss.item())
+                optimizer.zero_grad()
+                continue
+
+            scaler.scale(loss).backward()
+            # FIX 7 applied here: unscale then clip before the optimizer step.
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+
             progress.set_postfix(loss=float(loss.item()), step=batch_idx + 1)
             if batch_idx % 10 == 0:
                 LOGGER.info(
-                    "Epoch=%d batch=%d | loss=%.4f | scores=%s",
+                    "Epoch=%d batch=%d | loss=%.4f | scores=%s\n",
                     epoch + 1,
                     batch_idx + 1,
                     loss.item(),
                     tensor_shape(scores),
                 )
+
 
 if __name__ == '__main__':
     main()
