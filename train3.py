@@ -4,6 +4,7 @@ import os
 import sys
 
 import torch
+from numpy import dtype
 from PIL import Image
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -100,10 +101,12 @@ class CoLLM(torch.nn.Module):
         self,
         model_name="Qwen/Qwen3.5-2B",
         projection_dim=256,
+        num_embeddings=4,
     ):
         super().__init__()
         self.projection_dim = projection_dim
-        self.model_dtype = torch.float16 if device == "cuda" else "auto"
+        self.model_dtype = torch.float16 if device == "cuda" else torch.float32
+        self.num_embeddings = num_embeddings
 
         self.model = AutoModelForMultimodalLM.from_pretrained(
             model_name,
@@ -119,8 +122,15 @@ class CoLLM(torch.nn.Module):
         ]
         self.model.lm_head = None
 
-    @staticmethod
-    def make_inputs(processor, image, text):
+        hidden_dim = 1024
+        self.cls_probes = torch.nn.Parameter(
+            torch.randn(num_embeddings, hidden_dim, dtype=self.model_dtype)
+        )
+        self.probe_proj = torch.nn.Linear(
+            hidden_dim, projection_dim, dtype=self.model_dtype
+        )
+
+    def make_inputs(self, processor, image, text):
         if not isinstance(image, (list, tuple)):
             image = [image]
         if isinstance(text, str):
@@ -166,8 +176,21 @@ class CoLLM(torch.nn.Module):
         outputs = self.model.model(
             **inputs, output_hidden_states=True, return_dict=True
         )
-        hidden = outputs.hidden_states[-1]  # (batch, seq_len, 2048)
-        return hidden
+        hidden = outputs.hidden_states[-1]  # (batch, seq_len, hidden_dim)
+        mask = inputs["attention_mask"].float()  # (B, S)
+
+        scores = torch.matmul(
+            self.cls_probes.float().unsqueeze(0),  # (1, K, H)
+            hidden.transpose(1, 2),  # (B, H, S)
+        )  # (B, K, S)
+
+        scores = scores.masked_fill(mask.unsqueeze(1) == 0, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)  # (B, K, S)
+        pooled = torch.matmul(attn, hidden)  # (B, K, H)
+
+        embeddings = self.probe_proj(pooled)  # (B, K, projection_dim)
+        embeddings = F.normalize(embeddings, dim=-1)
+        return embeddings
 
     def loss(self):
         pass
@@ -182,14 +205,31 @@ def collm_contrastive_collate_fn(batch):
     }
 
 
+def param_summary(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+
+    def fmt(n):
+        if n >= 1e9:
+            return f"{n / 1e9:.2f}B"
+        if n >= 1e6:
+            return f"{n / 1e6:.2f}M"
+        if n >= 1e3:
+            return f"{n / 1e3:.2f}K"
+        return str(n)
+
+    LOGGER.info(f"Total      : {fmt(total):>10}  ({total:,})")
+    LOGGER.info(f"Trainable  : {fmt(trainable):>10}  ({trainable:,})")
+    LOGGER.info(f"Frozen     : {fmt(frozen):>10}  ({frozen:,})")
+
+
 def main():
     processor_name = "Qwen/Qwen3.5-0.8B"
     model_name = "Qwen/Qwen3.5-0.8B"
 
-    batch_size = 4
+    batch_size = 32
     num_workers = 4
-    # FIX 7 (NaN): Clip gradients to prevent fp16 explosion.
-    max_grad_norm = 1.0
 
     LOGGER.info("Loading processor: %s", processor_name)
     processor = AutoProcessor.from_pretrained(processor_name, trust_remote_code=True)
@@ -198,14 +238,15 @@ def main():
     LOGGER.info("Loading model: %s", model_name)
     model = CoLLM(model_name=model_name)
     model = model.to(device)
+    param_summary(model)
     LOGGER.info("Model loaded and ready")
 
-    # img = Image.open("./images/00000/cat.webp")
-    # txt = "describe this image"
+    img = Image.open("./images/00000/cat.webp")
+    txt = "describe this image"
 
-    # hidden = model.forward(img, txt, processor)
+    hidden = model.forward(img, txt, processor)
 
-    # print(hidden.shape)
+    LOGGER.info(f"hidden shape: {hidden.shape}")
 
     LOGGER.info("Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled.jsonl")
     train_dataset = MTCIRDataset("./MTCIR/mtcir_expanded_shuffled.jsonl", "./images")
@@ -229,57 +270,6 @@ def main():
 
     EPOCHS = 1
     LOGGER.info("Starting training for %d epoch(s)", EPOCHS)
-
-    # for epoch in range(EPOCHS):
-    #     LOGGER.info("Running epoch %d/%d", epoch + 1, EPOCHS)
-    #     progress = tqdm(
-    #         train_loader,
-    #         desc=f"Epoch {epoch + 1}/{EPOCHS}",
-    #         leave=False,
-    #         file=sys.stdout,
-    #     )
-
-    #     for batch_idx, batch in enumerate(progress):
-    #         model.train()
-    #         optimizer.zero_grad()
-
-    #         query_tokens = model.forward(
-    #             batch["image"],
-    #             batch["modification_text"],
-    #             processor=processor,
-    #             return_attention_mask=True,
-    #         )
-
-    #         loss = 0
-    #         scores = 0
-
-    #         # NaN guard: skip the update if loss is bad rather than corrupting
-    #         # the model weights with NaN gradients.
-    #         if not torch.isfinite(loss):
-    #             LOGGER.warning("Batch=%d produced non-finite loss (%s), skipping update", batch_idx + 1, loss.item())
-    #             optimizer.zero_grad()
-    #             continue
-
-    #         scaler.scale(loss).backward()
-    #         # FIX 7 applied here: unscale then clip before the optimizer step.
-    #         scaler.unscale_(optimizer)
-    #         torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
-    #         scaler.step(optimizer)
-    #         scaler.update()
-
-    #         progress.set_postfix(loss=float(loss.item()), step=batch_idx + 1)
-    #         if batch_idx % 10 == 0:
-    #             LOGGER.info(
-    #                 "Epoch=%d batch=%d | loss=%.4f | scores=%s\n",
-    #                 epoch + 1,
-    #                 batch_idx + 1,
-    #                 loss.item(),
-    #                 tensor_shape(scores),
-    #             )
-
-    # output_path = "collm_model.pt"
-    # torch.save(model.state_dict(), output_path)
-    # LOGGER.info("Model saved to %s", output_path)
 
 
 if __name__ == "__main__":
