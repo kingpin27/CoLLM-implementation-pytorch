@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 
 import torch
 from numpy import dtype
@@ -100,8 +101,9 @@ class CoLLM(torch.nn.Module):
     def __init__(
         self,
         model_name="Qwen/Qwen3.5-2B",
-        projection_dim=256,
+        projection_dim=512,
         num_embeddings=4,
+        hidden_dim=512,
     ):
         super().__init__()
         self.projection_dim = projection_dim
@@ -122,7 +124,6 @@ class CoLLM(torch.nn.Module):
         ]
         self.model.lm_head = None
 
-        hidden_dim = 1024
         self.cls_probes = torch.nn.Parameter(
             torch.randn(num_embeddings, hidden_dim, dtype=self.model_dtype)
         )
@@ -227,16 +228,26 @@ def param_summary(model):
 def main():
     processor_name = "Qwen/Qwen3.5-0.8B"
     model_name = "Qwen/Qwen3.5-0.8B"
+    projection_dim = 512  # same as CLIP-B
+    num_embeddings = 4  # num of target proposals
+    hidden_dim = 512
 
+    epochs = 1
     batch_size = 32
     num_workers = 4
+    num_batches = 32 * 1024
 
     LOGGER.info("Loading processor: %s", processor_name)
     processor = AutoProcessor.from_pretrained(processor_name, trust_remote_code=True)
     LOGGER.info("Processor loaded")
 
     LOGGER.info("Loading model: %s", model_name)
-    model = CoLLM(model_name=model_name)
+    model = CoLLM(
+        model_name=model_name,
+        projection_dim=projection_dim,
+        num_embeddings=num_embeddings,
+        hidden_dim=hidden_dim,
+    )
     model = model.to(device)
     param_summary(model)
     LOGGER.info("Model loaded and ready")
@@ -261,6 +272,7 @@ def main():
         multiprocessing_context="spawn",
         pin_memory=False,
         collate_fn=collm_contrastive_collate_fn,
+        shuffle=True,
     )
 
     LOGGER.info("Initializing optimizer (AdamW, lr=1e-4)")
@@ -268,8 +280,44 @@ def main():
     LOGGER.info("Optimizer will update %d parameter tensors", len(trainable_params))
     optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
 
-    EPOCHS = 1
-    LOGGER.info("Starting training for %d epoch(s)", EPOCHS)
+    LOGGER.info("Starting training for %d epoch(s)", epochs)
+    LOGGER.info("Training on total exmaples: %d", num_batches * batch_size)
+
+    for epoch in range(epochs):
+        LOGGER.info("Running epoch %d/%d", epoch + 1, epochs)
+        pbar = tqdm(
+            total=num_batches,
+            desc=f"Epoch {epoch + 1}/{epochs}",
+            file=sys.stdout,
+            leave=False,
+        )
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx >= num_batches:
+                break
+            model.train()
+            optimizer.zero_grad()
+
+            # forwars pass
+            loss = 0
+
+            # backward pass
+            loss.backward()
+            optimizer.step()
+            pbar.update(1)
+            if batch_idx % 100 == 0:
+                LOGGER.info(
+                    "Epoch=%d batch=%d | loss=%.4f\n",
+                    epoch + 1,
+                    batch_idx + 1,
+                    loss.item(),
+                )
+        pbar.close()
+
+    LOGGER.info("saving model to CoLLM.pt")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_filename = f"collm_{timestamp}.pt"
+    torch.save(model.state_dict(), model_filename)
+    LOGGER.info(f"Model saved as: {model_filename}")
 
 
 if __name__ == "__main__":
