@@ -1,14 +1,14 @@
-import os
 import json
-import torch
 import logging
+import os
 import sys
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
+
+import torch
 from PIL import Image
 from torch.nn import functional as F
-from transformers import AutoModelForMultimodalLM, AutoProcessor
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
+from transformers import AutoModelForMultimodalLM, AutoProcessor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +28,9 @@ def tensor_shape(tensor):
 
 
 class MTCIRDataset(Dataset):
-    def __init__(self, annotations_file, img_dir, transform=None, target_transform=None):
+    def __init__(
+        self, annotations_file, img_dir, transform=None, target_transform=None
+    ):
         self.img_dir = img_dir
         self.annotations_file = annotations_file
         self.offsets = []
@@ -73,7 +75,8 @@ class MTCIRDataset(Dataset):
             "target_image": target_image,
             "modification_text": (
                 record["modifications"][0]
-                if isinstance(record.get("modifications"), list) and len(record["modifications"]) > 0
+                if isinstance(record.get("modifications"), list)
+                and len(record["modifications"]) > 0
                 else record.get("modifications", "")
             ),
         }
@@ -89,12 +92,20 @@ class CoLLM(torch.nn.Module):
         super().__init__()
         self.model_name = model_name
         self.projection_dim = projection_dim
-        self.device = "cuda" if torch.cuda.is_available() else ("mps" if torch.mps.is_available() else "cpu")
+        self.device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else ("mps" if torch.mps.is_available() else "cpu")
+        )
         self.model_dtype = torch.float16 if self.device == "cuda" else torch.float32
         self._forward_calls = 0
         self._train_only_projection = True
 
-        LOGGER.info("Initializing CoLLM with model=%s on device=%s", self.model_name, self.device)
+        LOGGER.info(
+            "Initializing CoLLM with model=%s on device=%s",
+            self.model_name,
+            self.device,
+        )
         self.model = AutoModelForMultimodalLM.from_pretrained(
             self.model_name,
             dtype=self.model_dtype,
@@ -109,16 +120,24 @@ class CoLLM(torch.nn.Module):
 
         if freeze_vision_encoder:
             self.freeze_vision_encoder()
-        self._train_only_projection = not any(p.requires_grad for p in self.model.parameters())
+        self._train_only_projection = not any(
+            p.requires_grad for p in self.model.parameters()
+        )
         model_dtype = self.model_dtype
         LOGGER.info("Loaded base model successfully. Model dtype=%s", model_dtype)
 
         hidden_dim = getattr(self.model.config, "hidden_size", 1024)
-        self.output_linear_projection = torch.nn.Linear(hidden_dim, self.projection_dim).to(
+        self.output_linear_projection = torch.nn.Linear(
+            hidden_dim, self.projection_dim
+        ).to(
             self.device,
             dtype=self.model_dtype,
         )
-        LOGGER.info("Initialized projection head with in/out dims: %d -> %d", hidden_dim, self.projection_dim)
+        LOGGER.info(
+            "Initialized projection head with in/out dims: %d -> %d",
+            hidden_dim,
+            self.projection_dim,
+        )
 
     def freeze_vision_encoder(self):
         """
@@ -165,12 +184,16 @@ class CoLLM(torch.nn.Module):
         rendered = []
         for m in messages:
             if not isinstance(m, dict):
-                raise TypeError(f"Expected message dict for chat template, got {type(m)}")
-            rendered.append(processor.apply_chat_template(
-                [m],
-                tokenize=False,
-                add_generation_prompt=False,
-            ))
+                raise TypeError(
+                    f"Expected message dict for chat template, got {type(m)}"
+                )
+            rendered.append(
+                processor.apply_chat_template(
+                    [m],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
         enc = processor(
             text=rendered,
             images=list(image),
@@ -190,7 +213,9 @@ class CoLLM(torch.nn.Module):
         # Even though weights are fp16, intermediate activations (e.g. the
         # attention tensors inside chunk_gated_delta_rule) are created in the
         # default dtype. autocast pins them to fp16, cutting peak memory ~2x.
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(self.device == "cuda")):
+        with torch.autocast(
+            device_type="cuda", dtype=torch.float16, enabled=(self.device == "cuda")
+        ):
             outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
         hidden = outputs.hidden_states[-1]
         hidden = hidden.to(self.output_linear_projection.weight.dtype)
@@ -202,7 +227,14 @@ class CoLLM(torch.nn.Module):
             return projected, mask
         return projected
 
-    def late_interaction_similarity(self, query_tokens, doc_tokens, query_mask=None, doc_mask=None, token_chunk_size=64):
+    def late_interaction_similarity(
+        self,
+        query_tokens,
+        doc_tokens,
+        query_mask=None,
+        doc_mask=None,
+        token_chunk_size=64,
+    ):
         """
         Compute ColBERT-style late interaction scores for a full BxB batch.
         Returns scores shape [B, B] where score[i, j] is q_i against d_j.
@@ -241,7 +273,9 @@ class CoLLM(torch.nn.Module):
 
         return scores
 
-    def infonce_loss(self, query_tokens, doc_tokens, temperature=0.05, query_mask=None, doc_mask=None):
+    def infonce_loss(
+        self, query_tokens, doc_tokens, temperature=0.05, query_mask=None, doc_mask=None
+    ):
         """
         InfoNCE over in-batch positives:
         each query i is positive with doc i, negatives are all other docs.
@@ -281,10 +315,12 @@ def main():
     model = CoLLM(model_name=model_name, freeze_vision_encoder=True)
     LOGGER.info("Model loaded and ready")
 
-    LOGGER.info("Creating dataset from %s", './MTCIR/mtcir_expanded_shuffled.jsonl')
-    train_dataset = MTCIRDataset('./MTCIR/mtcir_expanded_shuffled.jsonl', './images')
+    LOGGER.info("Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled.jsonl")
+    train_dataset = MTCIRDataset("./MTCIR/mtcir_expanded_shuffled.jsonl", "./images")
     LOGGER.info("Dataset ready with %d samples", len(train_dataset))
-    LOGGER.info("Creating DataLoader batch_size=%d, num_workers=%d", batch_size, num_workers)
+    LOGGER.info(
+        "Creating DataLoader batch_size=%d, num_workers=%d", batch_size, num_workers
+    )
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -324,7 +360,9 @@ def main():
                 processor=processor,
                 return_attention_mask=True,
             )
-            doc_prompts = ["Describe this image" for _ in range(len(batch["modification_text"]))]
+            doc_prompts = [
+                "Describe this image" for _ in range(len(batch["modification_text"]))
+            ]
             doc_tokens, doc_mask = model.forward(
                 batch["target_image"],
                 doc_prompts,
@@ -342,7 +380,11 @@ def main():
             # NaN guard: skip the update if loss is bad rather than corrupting
             # the model weights with NaN gradients.
             if not torch.isfinite(loss):
-                LOGGER.warning("Batch=%d produced non-finite loss (%s), skipping update", batch_idx + 1, loss.item())
+                LOGGER.warning(
+                    "Batch=%d produced non-finite loss (%s), skipping update",
+                    batch_idx + 1,
+                    loss.item(),
+                )
                 optimizer.zero_grad()
                 continue
 
@@ -364,5 +406,5 @@ def main():
                 )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
