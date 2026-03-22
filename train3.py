@@ -259,11 +259,6 @@ def main():
     LOGGER.info("Model loaded and ready")
 
     model.model.model.language_model.gradient_checkpointing_enable()
-    try:
-        model.model.model.visual.gradient_checkpointing_enable()
-    except AttributeError:
-        LOGGER.info("Visual encoder does not support gradient checkpointing, skipping")
-
     model.model.model.language_model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
