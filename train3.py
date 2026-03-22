@@ -126,9 +126,7 @@ class CoLLM(torch.nn.Module):
         self.cls_probes = torch.nn.Parameter(
             torch.randn(num_embeddings, hidden_dim, dtype=self.model_dtype)
         )
-        self.probe_proj = torch.nn.Linear(
-            hidden_dim, projection_dim, dtype=self.model_dtype
-        )
+        self.probe_proj = torch.nn.Linear(hidden_dim, projection_dim)
 
     def make_inputs(self, processor, image, text):
         if not isinstance(image, (list, tuple)):
