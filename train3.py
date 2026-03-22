@@ -4,8 +4,8 @@ import os
 import sys
 from datetime import datetime
 
+import numpy as np
 import torch
-from numpy import dtype
 from PIL import Image
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -40,9 +40,10 @@ def tensor_shape(tensor):
 
 class MTCIRDataset(Dataset):
     def __init__(
-        self, annotations_file, img_dir, transform=None, target_transform=None
+        self, annotations_file, img_dir, emb_dir, transform=None, target_transform=None
     ):
         self.img_dir = img_dir
+        self.emb_dir = emb_dir
         self.annotations_file = annotations_file
         self.offsets = []
 
@@ -75,19 +76,17 @@ class MTCIRDataset(Dataset):
         source_image = Image.open(source_path).convert("RGB")
         # target_image = Image.open(target_path).convert("RGB")
 
-        target_image = [
-            0.1 for i in range(512)
-        ]  # TODO: embedding using clip stored in some file preprocessed to reduce vram usage
+        target_image_emb = np.load(
+            os.path.join(self.emb_dir, record["target_image"][:-4] + ".npy")
+        )
 
         if self.transform is not None:
             source_image = self.transform(source_image)
-        # if self.target_transform is not None:
-        #     target_image = self.target_transform(target_image)
 
         return {
             "id": record["id"],
             "image": source_image,
-            "target_image": target_image,
+            "target_image_emb": target_image_emb,
             "modification_text": (
                 record["modifications"][0]
                 if isinstance(record.get("modifications"), list)
@@ -100,7 +99,7 @@ class MTCIRDataset(Dataset):
 class CoLLM(torch.nn.Module):
     def __init__(
         self,
-        model_name="Qwen/Qwen3.5-2B",
+        model_name="Qwen/Qwen3.5-0.8B",
         projection_dim=512,
         num_embeddings=4,
         hidden_dim=512,
@@ -193,15 +192,12 @@ class CoLLM(torch.nn.Module):
         embeddings = F.normalize(embeddings, dim=-1)
         return embeddings
 
-    def loss(self):
-        pass
-
 
 def collm_contrastive_collate_fn(batch):
     return {
         "id": [item["id"] for item in batch],
         "image": [item["image"] for item in batch],
-        "target_image": [item["target_image"] for item in batch],
+        "target_image_emb": [item["target_image_emb"] for item in batch],  # fixed key
         "modification_text": [item["modification_text"] for item in batch],
     }
 
@@ -228,12 +224,18 @@ def param_summary(model):
 def main():
     processor_name = "Qwen/Qwen3.5-0.8B"
     model_name = "Qwen/Qwen3.5-0.8B"
-    projection_dim = 512  # same as CLIP-B
-    num_embeddings = 4  # num of target proposals
-    hidden_dim = 512
+    projection_dim = 512  # same as CLIP-B = P
+    num_embeddings = 4  # num of target proposals = K
+    hidden_dim = 1024
+
+    # Temperature for soft probe selection — lower = closer to hard argmax.
+    # Can be annealed toward 0 over training for increasingly competitive probes.
+    probe_temperature = 0.1
+    # Temperature for InfoNCE contrastive loss
+    infonce_temperature = 0.07
 
     epochs = 1
-    batch_size = 32
+    batch_size = 32  # = B
     num_workers = 4
     num_batches = 32 * 1024
 
@@ -252,15 +254,19 @@ def main():
     param_summary(model)
     LOGGER.info("Model loaded and ready")
 
-    img = Image.open("./images/00000/cat.webp")
-    txt = "describe this image"
+    # img = Image.open("./images/00000/cat.webp")
+    # txt = "describe this image"
 
-    hidden = model.forward(img, txt, processor)
+    # hidden = model.forward(img, txt, processor)
 
-    LOGGER.info(f"hidden shape: {hidden.shape}")
+    # LOGGER.info(f"hidden shape: {hidden.shape}")
 
     LOGGER.info("Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled.jsonl")
-    train_dataset = MTCIRDataset("./MTCIR/mtcir_expanded_shuffled.jsonl", "./images")
+    train_dataset = MTCIRDataset(
+        "./MTCIR/mtcir_expanded_shuffled.jsonl",
+        "./images",
+        "./embeddings",
+    )
     LOGGER.info("Dataset ready with %d samples", len(train_dataset))
     LOGGER.info(
         "Creating DataLoader batch_size=%d, num_workers=%d", batch_size, num_workers
@@ -287,7 +293,6 @@ def main():
         LOGGER.info("Running epoch %d/%d", epoch + 1, epochs)
         pbar = tqdm(
             total=num_batches,
-            desc=f"Epoch {epoch + 1}/{epochs}",
             file=sys.stdout,
             leave=False,
         )
@@ -298,12 +303,56 @@ def main():
             optimizer.zero_grad()
 
             # forwars pass
-            loss = 0
+            embeddings = model.forward(
+                images=batch["image"],
+                text=batch["modification_text"],
+                processor=processor,
+            )  # (B, K, P)
+
+            # target embeddings: frozen CLIP vectors, not part of grad graph
+            target_emb = (
+                torch.stack([torch.from_numpy(e) for e in batch["target_image_emb"]])
+                .to(device)
+                .float()
+            )  # (B, P)
+            target_emb = F.normalize(target_emb, dim=-1)  # (B, P)
+
+            # --- soft probe selection (fully differentiable) ---
+            # Similarity of every probe against its own target: (B, K)
+            per_probe_sim = torch.einsum(
+                "bkp,bp->bk", embeddings.float(), target_emb
+            )  # (B, K)
+
+            # Soft convex combination weighted by proximity to target.
+            # Gradient flows to ALL K probes; sharpness controlled by probe_temperature.
+            # As probe_temperature -> 0 this approaches hard argmax.
+            probe_weights = torch.softmax(
+                per_probe_sim / probe_temperature, dim=1
+            )  # (B, K)
+            best_emb = torch.einsum(
+                "bk,bkp->bp", probe_weights, embeddings.float()
+            )  # (B, P) — still unit-norm after softmax combination (approx)
+            best_emb = F.normalize(best_emb, dim=-1)  # re-normalise to be exact
+
+            # --- symmetric InfoNCE loss ---
+            # Logit matrix: each query's composed embedding vs every target in batch.
+            # Diagonal entries are the positives.
+            logits = (
+                torch.matmul(best_emb, target_emb.T) / infonce_temperature
+            )  # (B, B)
+            labels = torch.arange(logits.size(0), device=device)  # (B,)
+
+            loss = (
+                F.cross_entropy(logits, labels)  # query -> target
+                + F.cross_entropy(logits.T, labels)  # target -> query
+            ) / 2
 
             # backward pass
             loss.backward()
             optimizer.step()
+
             pbar.update(1)
+
             if batch_idx % 100 == 0:
                 LOGGER.info(
                     "Epoch=%d batch=%d | loss=%.4f\n",

@@ -2,3 +2,4 @@
 MTCIR
 images
 embeddings
+*.pt
