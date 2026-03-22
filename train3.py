@@ -10,7 +10,11 @@ from PIL import Image
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from transformers import AutoModelForMultimodalLM, AutoProcessor
+from transformers import (
+    AutoModelForMultimodalLM,
+    AutoProcessor,
+    get_linear_schedule_with_warmup,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -231,12 +235,13 @@ def main():
     # Temperature for soft probe selection — lower = closer to hard argmax.
     # Can be annealed toward 0 over training for increasingly competitive probes.
     probe_temperature = 0.1
-    # Temperature for InfoNCE contrastive loss
-    infonce_temperature = 0.07
+    # Temperature for InfoNCE contrastive loss.
+    # 0.07 (CLIP default) is aggressive early in training; 0.1 is safer to start.
+    infonce_temperature = 0.1
 
     epochs = 1
-    batch_size = 4  # = B
-    num_workers = 4
+    batch_size = 16  # = B
+    num_workers = 8
     num_batches = int((1024 * 1024) / batch_size)
 
     LOGGER.info("Loading processor: %s", processor_name)
@@ -253,13 +258,6 @@ def main():
     model = model.to(device)
     param_summary(model)
     LOGGER.info("Model loaded and ready")
-
-    # img = Image.open("./images/00000/cat.webp")
-    # txt = "describe this image"
-
-    # hidden = model.forward(img, txt, processor)
-
-    # LOGGER.info(f"hidden shape: {hidden.shape}")
 
     LOGGER.info("Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled.jsonl")
     train_dataset = MTCIRDataset(
@@ -286,9 +284,16 @@ def main():
     LOGGER.info("Optimizer will update %d parameter tensors", len(trainable_params))
     optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
 
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=200,
+        num_training_steps=num_batches,
+    )
+
     LOGGER.info("Starting training for %d epoch(s)", epochs)
     LOGGER.info("Training on total exmaples: %d", num_batches * batch_size)
 
+    skipped = 0
     for epoch in range(epochs):
         LOGGER.info("Running epoch %d/%d", epoch + 1, epochs)
         pbar = tqdm(
@@ -308,6 +313,21 @@ def main():
                 text=batch["modification_text"],
                 processor=processor,
             )  # (B, K, P)
+
+            # Guard: skip batch if backbone produced inf/nan hidden states.
+            # This can happen early in training when fp16 attention overflows.
+            if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+                skipped += 1
+                LOGGER.warning(
+                    "Epoch=%d batch=%d | bad embeddings (nan/inf), skipping "
+                    "[total skipped=%d]",
+                    epoch + 1,
+                    batch_idx + 1,
+                    skipped,
+                )
+                scheduler.step()
+                pbar.update(1)
+                continue
 
             # target embeddings: frozen CLIP vectors, not part of grad graph
             target_emb = (
@@ -349,16 +369,21 @@ def main():
 
             # backward pass
             loss.backward()
+            # Clip gradients — prevents exploding gradients from large noisy
+            # early batches, especially important with partially-frozen LLM layers.
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
             pbar.update(1)
 
             if batch_idx % 100 == 0:
                 LOGGER.info(
-                    "Epoch=%d batch=%d | loss=%.4f\n",
+                    "Epoch=%d batch=%d | loss=%.4f | lr=%.2e\n",
                     epoch + 1,
                     batch_idx + 1,
                     loss.item(),
+                    scheduler.get_last_lr()[0],
                 )
         pbar.close()
 
