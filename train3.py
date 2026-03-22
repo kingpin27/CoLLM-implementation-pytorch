@@ -235,9 +235,9 @@ def main():
     infonce_temperature = 0.07
 
     epochs = 1
-    batch_size = 32  # = B
+    batch_size = 4  # = B
     num_workers = 4
-    num_batches = 32 * 1024
+    num_batches = int((1024 * 1024) / batch_size)
 
     LOGGER.info("Loading processor: %s", processor_name)
     processor = AutoProcessor.from_pretrained(processor_name, trust_remote_code=True)
