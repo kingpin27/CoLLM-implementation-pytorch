@@ -176,7 +176,9 @@ class CoLLM(torch.nn.Module):
         outputs = self.model.model(
             **inputs, output_hidden_states=True, return_dict=True
         )
-        hidden = outputs.hidden_states[-1]  # (batch, seq_len, hidden_dim)
+        hidden = outputs.hidden_states[
+            -1
+        ].float()  # (B, S, H) — cast to fp32 for stable matmul
         mask = inputs["attention_mask"].float()  # (B, S)
 
         scores = torch.matmul(
