@@ -110,7 +110,7 @@ class CoLLM(torch.nn.Module):
     ):
         super().__init__()
         self.projection_dim = projection_dim
-        self.model_dtype = torch.float16 if device == "cuda" else torch.float32
+        self.model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
         self.num_embeddings = num_embeddings
 
         self.model = AutoModelForMultimodalLM.from_pretrained(
@@ -130,7 +130,11 @@ class CoLLM(torch.nn.Module):
         self.cls_probes = torch.nn.Parameter(
             torch.randn(num_embeddings, hidden_dim, dtype=self.model_dtype)
         )
-        self.probe_proj = torch.nn.Linear(hidden_dim, projection_dim)
+        self.probe_proj = torch.nn.Linear(
+            hidden_dim,
+            projection_dim,
+            dtype=self.model_dtype,
+        )
 
     def make_inputs(self, processor, image, text):
         if not isinstance(image, (list, tuple)):
@@ -175,15 +179,15 @@ class CoLLM(torch.nn.Module):
 
     def forward(self, images, text, processor):
         inputs = self.make_inputs(processor, images, text)
-        with torch.autocast(device_type=device, dtype=torch.float16):
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
             outputs = self.model.model(
                 **inputs, output_hidden_states=True, return_dict=True
             )
-        hidden = outputs.hidden_states[-1].float()  # cast OUT of fp16 immediately
-        mask = inputs["attention_mask"].float()  # (B, S)
+        hidden = outputs.hidden_states[-1]  # cast OUT of fp16 immediately
+        mask = inputs["attention_mask"].to(torch.bfloat16)  # (B, S)
 
         scores = torch.matmul(
-            self.cls_probes.float().unsqueeze(0),  # (1, K, H)
+            self.cls_probes.unsqueeze(0),  # (1, K, H)
             hidden.transpose(1, 2),  # (B, H, S)
         )  # (B, K, S)
 
@@ -287,7 +291,6 @@ def main():
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     LOGGER.info("Optimizer will update %d parameter tensors", len(trainable_params))
     optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, eps=1e-6)
-    scaler = torch.cuda.amp.GradScaler()
 
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -373,11 +376,9 @@ def main():
             ) / 2
 
             # backward pass
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             pbar.update(1)
 
