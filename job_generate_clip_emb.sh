@@ -15,7 +15,7 @@ echo "Node: $(hostname)"
 nvidia-smi
 
 module purge
-module load cuda/12.4  
+module load cuda/12.4
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate collm
 
@@ -36,7 +36,7 @@ cd /home/anirban/anishc/CoLLM-implementation-pytorch
 start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-srun python train2.py
+srun python generate_clip_emb.py
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))
