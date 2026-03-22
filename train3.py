@@ -379,6 +379,7 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
             pbar.update(1)
 
