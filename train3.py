@@ -243,7 +243,7 @@ def main():
     infonce_temperature = 0.1
 
     epochs = 1
-    batch_size = 8  # = B
+    batch_size = 32  # = B
     num_workers = 8
     num_batches = int((1024 * 1024) / batch_size)
 
