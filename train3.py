@@ -241,6 +241,7 @@ def main():
     # Temperature for InfoNCE contrastive loss.
     # 0.07 (CLIP default) is aggressive early in training; 0.1 is safer to start.
     infonce_temperature = 0.1
+    diversity_weight = 0.1
 
     epochs = 1
     batch_size = 32  # = B
@@ -370,10 +371,20 @@ def main():
             )  # (B, B)
             labels = torch.arange(logits.size(0), device=device)  # (B,)
 
+            # Regularise cls_probes directly — they live in a fixed hidden_dim space
+            probe_gram = torch.mm(
+                F.normalize(model.cls_probes.float(), dim=-1),
+                F.normalize(model.cls_probes.float(), dim=-1).T,
+            )  # (K, K)
+            off_diag = probe_gram.masked_fill(
+                torch.eye(num_embeddings, device=device, dtype=torch.bool), 0.0
+            )
+            diversity_loss = (off_diag**2).sum()
+
             loss = (
                 F.cross_entropy(logits, labels)  # query -> target
                 + F.cross_entropy(logits.T, labels)  # target -> query
-            ) / 2
+            ) / 2 + diversity_weight * diversity_loss
 
             # backward pass
             loss.backward()
