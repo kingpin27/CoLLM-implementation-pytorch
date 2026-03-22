@@ -35,7 +35,7 @@ LOGGER.info(f"accelerator type: {device}")
 
 # FIX 1 (OOM): Tell PyTorch's allocator to use expandable segments
 # to reduce fragmentation before we even start.
-# os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 
 def tensor_shape(tensor):
@@ -175,12 +175,11 @@ class CoLLM(torch.nn.Module):
 
     def forward(self, images, text, processor):
         inputs = self.make_inputs(processor, images, text)
-        outputs = self.model.model(
-            **inputs, output_hidden_states=True, return_dict=True
-        )
-        hidden = outputs.hidden_states[
-            -1
-        ].float()  # (B, S, H) — cast to fp32 for stable matmul
+        with torch.autocast(device_type=device, dtype=torch.float16):
+            outputs = self.model.model(
+                **inputs, output_hidden_states=True, return_dict=True
+            )
+        hidden = outputs.hidden_states[-1].float()  # cast OUT of fp16 immediately
         mask = inputs["attention_mask"].float()  # (B, S)
 
         scores = torch.matmul(
@@ -240,7 +239,7 @@ def main():
     infonce_temperature = 0.1
 
     epochs = 1
-    batch_size = 16  # = B
+    batch_size = 8  # = B
     num_workers = 8
     num_batches = int((1024 * 1024) / batch_size)
 
@@ -258,6 +257,16 @@ def main():
     model = model.to(device)
     param_summary(model)
     LOGGER.info("Model loaded and ready")
+
+    model.model.model.language_model.gradient_checkpointing_enable()
+    try:
+        model.model.model.visual.gradient_checkpointing_enable()
+    except AttributeError:
+        LOGGER.info("Visual encoder does not support gradient checkpointing, skipping")
+
+    model.model.model.language_model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
 
     LOGGER.info("Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled.jsonl")
     train_dataset = MTCIRDataset(
@@ -282,11 +291,12 @@ def main():
     LOGGER.info("Initializing optimizer (AdamW, lr=1e-4)")
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     LOGGER.info("Optimizer will update %d parameter tensors", len(trainable_params))
-    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, eps=1e-6)
+    scaler = torch.cuda.amp.GradScaler()
 
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=200,
+        num_warmup_steps=500,
         num_training_steps=num_batches,
     )
 
@@ -368,12 +378,11 @@ def main():
             ) / 2
 
             # backward pass
-            loss.backward()
-            # Clip gradients — prevents exploding gradients from large noisy
-            # early batches, especially important with partially-frozen LLM layers.
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             pbar.update(1)
 
