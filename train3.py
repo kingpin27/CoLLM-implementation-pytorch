@@ -224,7 +224,7 @@ def param_summary(model):
 def main():
     processor_name = "Qwen/Qwen3.5-0.8B"
     model_name = "Qwen/Qwen3.5-0.8B"
-    projection_dim = 512  # same as CLIP-B = P
+    projection_dim = 768  # same as CLIP-B = P
     num_embeddings = 4  # num of target proposals = K
     hidden_dim = 1024
 
