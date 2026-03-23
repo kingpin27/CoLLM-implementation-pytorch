@@ -36,7 +36,7 @@ cd /home/anirban/anishc/CoLLM-implementation-pytorch
 start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-srun python generate_circo_submission.py \
+srun python circo_eval.py \
     --checkpoint ~/CoLLM-implementation-pytorch/collm_0148243.pt \
     --split val \
     --annotations ~/CIRCO/annotations/val.json \
