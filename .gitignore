@@ -3,3 +3,5 @@ MTCIR
 images
 embeddings
 *.pt
+*.out
+*.err
