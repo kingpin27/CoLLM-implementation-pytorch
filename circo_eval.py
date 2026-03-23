@@ -78,18 +78,33 @@ def load_queries(annotations_path: str, coco_img_dir: str):
 
 # ── 3. Encode a single query with CoLLM ───────────────────────────────────────
 @torch.no_grad()
-def encode_query(model, processor, image: Image.Image, text: str) -> torch.Tensor:
-    """Returns a (P,) composed embedding."""
-    embeddings = model.forward(
-        images=[image],
-        text=[text],
-        processor=processor,
-    )  # (1, K, P)
+def encode_queries_batch(model, processor, images, texts, gallery_embs):
+    """
+    Instead of collapsing K embeddings into one, compute similarity
+    against the gallery for all K probes and take the max.
 
-    # Mean-pool across K probes — safest at inference without a target signal.
-    # Alternatively use: embeddings[0].norm(dim=-1).argmax() for hard selection.
-    composed = embeddings[0].float().mean(dim=0)  # (P,)
-    return F.normalize(composed, dim=-1)
+    Returns: (B,) best similarity score per query — already resolved to top-50.
+    """
+    embeddings = model.forward(
+        images=images,
+        text=texts,
+        processor=processor,
+    )  # (B, K, P)
+
+    B, K, P = embeddings.shape
+
+    # Flatten to (B*K, P) → compute all sims at once
+    flat_embs = embeddings.float().reshape(B * K, P)  # (B*K, P)
+    flat_embs = F.normalize(flat_embs, dim=-1)
+
+    # sims: (B*K, N)
+    sims = flat_embs @ gallery_embs.T  # (B*K, N)
+
+    # Reshape to (B, K, N), take max over K
+    sims = sims.reshape(B, K, -1)  # (B, K, N)
+    best_sims, _ = sims.max(dim=1)  # (B, N)
+
+    return best_sims  # (B, N) — use .topk(50) per row
 
 
 # ── 4. Main ────────────────────────────────────────────────────────────────────
@@ -131,19 +146,26 @@ def main(args):
     queries = load_queries(args.annotations, args.coco_img_dir)
     print(f"Loaded {len(queries)} queries from {args.annotations}")
 
+    batch_size = 4
+
     # --- Retrieve top-50 for each query ---
     predictions = {}
-    for q in tqdm(queries, desc="Encoding queries"):
-        img = Image.open(q["image_path"]).convert("RGB")
-        query_emb = encode_query(model, processor, img, q["modification_text"])  # (P,)
+    for batch_start in tqdm(
+        range(0, len(queries), batch_size), desc="Encoding queries"
+    ):
+        batch = queries[batch_start : batch_start + batch_size]
+        images = [Image.open(q["image_path"]).convert("RGB") for q in batch]
+        texts = [q["modification_text"] for q in batch]
 
-        # Cosine similarity against full gallery
-        sims = gallery_embs @ query_emb  # (N,)
-        top50_local = sims.topk(50).indices  # indices into gallery_embs
+        best_sims = encode_queries_batch(
+            model, processor, images, texts, gallery_embs
+        )  # (B, N)
 
-        # Map back to COCO image IDs (what the server expects)
-        top50_coco_ids = [coco_ids[i] for i in top50_local.cpu().tolist()]
-        predictions[q["query_id"]] = top50_coco_ids
+        for i, q in enumerate(batch):
+            top50_local = best_sims[i].topk(50).indices
+            predictions[q["query_id"]] = [
+                coco_ids[j] for j in top50_local.cpu().tolist()
+            ]
 
     # --- Save submission file ---
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
