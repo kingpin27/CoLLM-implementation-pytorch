@@ -22,13 +22,8 @@ device = (
 
 
 # ── 1. Build the gallery index ─────────────────────────────────────────────────
-def build_gallery(coco_img_dir: str, image_info_path: str):
-    """
-    Returns:
-        gallery_embs  : torch.Tensor  (N, P)  — CLIP L2-normed embeddings
-        coco_ids      : list[int]              — COCO image id for each row
-    """
-    import clip  # pip install git+https://github.com/openai/CLIP.git
+def build_gallery(coco_img_dir: str, image_info_path: str, batch_size: int = 256):
+    import clip
 
     clip_model, preprocess = clip.load("ViT-B/32", device=device)
     clip_model.eval()
@@ -37,19 +32,38 @@ def build_gallery(coco_img_dir: str, image_info_path: str):
         image_info = json.load(f)["images"]
 
     coco_ids, embs = [], []
-    for info in tqdm(image_info, desc="Encoding gallery"):
-        img_path = os.path.join(coco_img_dir, info["file_name"])
-        try:
-            img = (
-                preprocess(Image.open(img_path).convert("RGB")).unsqueeze(0).to(device)
-            )
-            with torch.no_grad():
-                emb = clip_model.encode_image(img).float()
-                emb = F.normalize(emb, dim=-1)
-            coco_ids.append(info["id"])
-            embs.append(emb.cpu())
-        except Exception as e:
-            print(f"Skipping {img_path}: {e}")
+
+    # pre-collect valid paths
+    valid = []
+    for info in image_info:
+        path = os.path.join(coco_img_dir, info["file_name"])
+        if os.path.exists(path):
+            valid.append((info["id"], path))
+        else:
+            print(f"Missing: {path}")
+
+    for batch_start in tqdm(range(0, len(valid), batch_size), desc="Encoding gallery"):
+        batch = valid[batch_start : batch_start + batch_size]
+
+        imgs, ids = [], []
+        for coco_id, path in batch:
+            try:
+                img = preprocess(Image.open(path).convert("RGB"))
+                imgs.append(img)
+                ids.append(coco_id)
+            except Exception as e:
+                print(f"Skipping {path}: {e}")
+
+        if not imgs:
+            continue
+
+        batch_tensor = torch.stack(imgs).to(device)  # (B, C, H, W)
+        with torch.no_grad():
+            batch_emb = clip_model.encode_image(batch_tensor).float()
+            batch_emb = F.normalize(batch_emb, dim=-1)  # (B, P)
+
+        coco_ids.extend(ids)
+        embs.append(batch_emb.cpu())
 
     gallery_embs = torch.cat(embs, dim=0)  # (N, P)
     return gallery_embs, coco_ids
