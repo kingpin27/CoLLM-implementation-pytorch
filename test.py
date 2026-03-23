@@ -1,20 +1,21 @@
 import torch
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-import pandas as pd
-import os
+import torch.nn.functional as F
 from PIL import Image
-from torch.nn import functional as F
-from transformers import AutoModelForMultimodalLM , AutoProcessor
-from tqdm.auto import tqdm
+from transformers import AutoProcessor
 
+from train3 import CoLLM  # import your model class
 
-processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-2B", trust_remote_code=True)
-model = AutoModelForMultimodalLM.from_pretrained(
-        "Qwen/Qwen3.5-2B",
-        torch_dtype="auto",
-        device_map="auto",
-        trust_remote_code=True
-    )
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print(model.dtype)
+# --- Load ---
+model = CoLLM(
+    model_name="Qwen/Qwen3.5-0.8B",
+    projection_dim=768,
+    num_embeddings=4,
+    hidden_dim=1024,
+)
+model.load_state_dict(torch.load("collm_20250323_120000.pt", map_location=device))
+model.to(device)
+model.eval()
+
+processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
