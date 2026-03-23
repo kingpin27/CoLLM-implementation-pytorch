@@ -65,6 +65,9 @@ def build_gallery(coco_img_dir: str, image_info_path: str, batch_size: int = 256
         coco_ids.extend(ids)
         embs.append(batch_emb.cpu())
 
+        del batch_tensor, batch_emb
+        torch.cuda.empty_cache()
+
     gallery_embs = torch.cat(embs, dim=0)  # (N, P)
     return gallery_embs, coco_ids
 
@@ -123,19 +126,6 @@ def encode_queries_batch(model, processor, images, texts, gallery_embs):
 
 # ── 4. Main ────────────────────────────────────────────────────────────────────
 def main(args):
-    # --- Load model ---
-    print(f"Loading model from {args.checkpoint}")
-    model = CoLLM(
-        model_name=args.model_name,
-        projection_dim=args.projection_dim,
-        num_embeddings=args.num_embeddings,
-        hidden_dim=args.hidden_dim,
-    )
-    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
-    model.to(device).eval()
-
-    processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
-    print("Model ready")
 
     # --- Build gallery ---
     # CIRCO gallery = COCO 2017 unlabeled images
@@ -159,6 +149,20 @@ def main(args):
     # --- Load CIRCO queries ---
     queries = load_queries(args.annotations, args.coco_img_dir)
     print(f"Loaded {len(queries)} queries from {args.annotations}")
+
+    # --- Load model ---
+    print(f"Loading model from {args.checkpoint}")
+    model = CoLLM(
+        model_name=args.model_name,
+        projection_dim=args.projection_dim,
+        num_embeddings=args.num_embeddings,
+        hidden_dim=args.hidden_dim,
+    )
+    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    model.to(device).eval()
+
+    processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
+    print("Model ready")
 
     batch_size = 4
 
