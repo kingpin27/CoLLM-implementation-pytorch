@@ -22,7 +22,7 @@ device = (
 
 
 # ── 1. Build the gallery index ─────────────────────────────────────────────────
-def build_gallery(coco_img_dir: str, image_info_path: str, batch_size: int = 256):
+def build_gallery(coco_img_dir: str, image_info_path: str, batch_size: int = 64):
     import clip
 
     clip_model, preprocess = clip.load("ViT-B/32", device=device)
@@ -30,8 +30,6 @@ def build_gallery(coco_img_dir: str, image_info_path: str, batch_size: int = 256
 
     with open(image_info_path) as f:
         image_info = json.load(f)["images"]
-
-    coco_ids, embs = [], []
 
     # pre-collect valid paths
     valid = []
@@ -41,6 +39,8 @@ def build_gallery(coco_img_dir: str, image_info_path: str, batch_size: int = 256
             valid.append((info["id"], path))
         else:
             print(f"Missing: {path}")
+
+    coco_ids, embs = [], []
 
     for batch_start in tqdm(range(0, len(valid), batch_size), desc="Encoding gallery"):
         batch = valid[batch_start : batch_start + batch_size]
@@ -57,16 +57,19 @@ def build_gallery(coco_img_dir: str, image_info_path: str, batch_size: int = 256
         if not imgs:
             continue
 
-        batch_tensor = torch.stack(imgs).to(device)  # (B, C, H, W)
+        batch_tensor = torch.stack(imgs).to(device)
+
         with torch.no_grad():
             batch_emb = clip_model.encode_image(batch_tensor).float()
-            batch_emb = F.normalize(batch_emb, dim=-1)  # (B, P)
+            batch_emb = F.normalize(batch_emb, dim=-1).cpu()
 
         coco_ids.extend(ids)
-        embs.append(batch_emb.cpu())
+        embs.append(batch_emb)
 
-        del batch_tensor, batch_emb
-        torch.cuda.empty_cache()
+        del batch_tensor, batch_emb, imgs, batch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     gallery_embs = torch.cat(embs, dim=0)  # (N, P)
     return gallery_embs, coco_ids
