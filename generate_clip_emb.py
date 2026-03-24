@@ -19,7 +19,7 @@ device = (
 print(f"Using device: {device}")
 
 # Load model and processor
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to("device")
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 IMAGES_FOLDER_PATH = "./images"
