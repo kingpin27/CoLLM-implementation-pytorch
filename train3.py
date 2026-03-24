@@ -298,7 +298,7 @@ def main():
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=500,
-        num_training_steps=num_batches,
+        num_training_steps=num_batches * 5,  # so only decays lr to 80%
     )
 
     LOGGER.info("Starting training for %d epoch(s)", epochs)
