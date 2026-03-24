@@ -244,7 +244,7 @@ def main():
     processor_name = "Qwen/Qwen3.5-0.8B"
     model_name = "Qwen/Qwen3.5-0.8B"
     projection_dim = 512  # same as CLIP-B = P
-    num_embeddings = 4  # num of target proposals = K
+    num_embeddings = 1  # num of target proposals = K
     hidden_dim = 1024
 
     # Temperature for soft probe selection — lower = closer to hard argmax.
@@ -421,7 +421,7 @@ def main():
 
     LOGGER.info("saving model to CoLLM.pt")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_filename = f"collm_4probes_{timestamp}.pt"
+    model_filename = f"collm_1probes_{timestamp}.pt"
     torch.save(model.state_dict(), model_filename)
     LOGGER.info(f"Model saved as: {model_filename}")
 

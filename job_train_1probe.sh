@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=four_probe
+#SBATCH --job-name=one_probe
 #SBATCH --partition=ada
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -36,7 +36,7 @@ cd /home/anirban/anishc/CoLLM-implementation-pytorch
 start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-srun python train.py
+srun python train_1probe.py
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))

@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoProcessor
 
-from train3 import CoLLM  # import your model class
+from train import CoLLM  # import your model class
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
