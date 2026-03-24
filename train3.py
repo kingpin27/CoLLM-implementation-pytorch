@@ -210,6 +210,17 @@ def collm_contrastive_collate_fn(batch):
     }
 
 
+def log_vram(label=""):
+    if device != "cuda":
+        return
+    allocated = torch.cuda.max_memory_allocated() / 1e9
+    reserved = torch.cuda.max_memory_reserved() / 1e9
+    LOGGER.info(
+        f"VRAM [{label}] peak allocated={allocated:.2f}GB  reserved={reserved:.2f}GB"
+    )
+    torch.cuda.reset_peak_memory_stats()  # reset so next window is fresh
+
+
 def param_summary(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -404,7 +415,9 @@ def main():
                     loss.item(),
                     scheduler.get_last_lr()[0],
                 )
+                log_vram(f"epoch={epoch + 1} batch={batch_idx + 1}")
         pbar.close()
+        log_vram(f"epoch={epoch + 1} end")
 
     LOGGER.info("saving model to CoLLM.pt")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
