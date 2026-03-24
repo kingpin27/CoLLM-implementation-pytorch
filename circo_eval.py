@@ -88,7 +88,9 @@ def load_queries(annotations_path: str, coco_img_dir: str):
         queries.append(
             {
                 "query_id": str(ann["id"]),
-                "image_path": os.path.join(coco_img_dir, ann["reference_img_id"]),
+                "image_path": os.path.join(
+                    coco_img_dir, f"{ann['reference_img_id']:012d}.jpg"
+                ),
                 # CIRCO annotation field for the relative caption:
                 "modification_text": ann["relative_caption"],
             }
