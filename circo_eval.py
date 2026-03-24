@@ -133,7 +133,9 @@ def main(args):
     # --- Build gallery ---
     # CIRCO gallery = COCO 2017 unlabeled images
     print("Building gallery index (this takes a while the first time)...")
-    gallery_cache = "clip_unlabeled2017_cache.pt"
+    gallery_cache = (
+        "/home/anirban/anishc/CoLLM-implementation-pytorch/clip_unlabeled2017_cache.pt"
+    )
     if os.path.exists(gallery_cache):
         print("  Loading cached gallery...")
         data = torch.load(gallery_cache)
