@@ -18,45 +18,67 @@ device = (
 )
 print(f"Using device: {device}")
 
-# Load model and processor
 model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+model.eval()
 
 IMAGES_FOLDER_PATH = "./images"
 EMBEDDINGS_FOLDER_PATH = "./embeddings"
+BATCH_SIZE = 512  # Ada 6000 can handle this easily
 
+
+def process_batch(batch_imgs, batch_out_paths):
+    inputs = processor(images=batch_imgs, return_tensors="pt", padding=True)
+    pixel_values = inputs["pixel_values"].to(device)
+    with torch.no_grad():
+        output = model.vision_model(pixel_values=pixel_values)
+        embs = model.visual_projection(output.pooler_output)  # (B, 512)
+        embs = F.normalize(embs, p=2, dim=-1).cpu().numpy()
+    for path, emb in zip(batch_out_paths, embs):
+        np.save(path, emb)
+
+
+# collect all valid (image_path, output_path) pairs first
+all_pairs = []
 folders = [
     f
     for f in os.listdir(IMAGES_FOLDER_PATH)
     if os.path.isdir(os.path.join(IMAGES_FOLDER_PATH, f))
 ]
-pbar = tqdm(
-    total=559447,
-    file=sys.stdout,
-    leave=False,
-)
 for folder in folders:
     for filename in os.listdir(os.path.join(IMAGES_FOLDER_PATH, folder)):
         ip_filepath = Path(os.path.join(IMAGES_FOLDER_PATH, folder, filename))
-
-        # Save as .npy instead of original extension
         op_filepath = Path(
             os.path.join(EMBEDDINGS_FOLDER_PATH, folder, ip_filepath.stem + ".npy")
         )
+        if op_filepath.exists():
+            continue  # skip already processed
         op_filepath.parent.mkdir(parents=True, exist_ok=True)
+        all_pairs.append((ip_filepath, op_filepath))
 
-        # Load image from INPUT path (was incorrectly using op_filepath)
-        image = Image.open(str(ip_filepath)).convert("RGB")
-        inputs = {
-            k: v.to(device)
-            for k, v in processor(images=image, return_tensors="pt").items()
-        }
+print(f"Total images to process: {len(all_pairs):,}")
 
-        with torch.no_grad():
-            image_embeds = model.get_image_features(**inputs)  # (1, 512)
-            image_embeds = F.normalize(image_embeds, p=2, dim=-1)
+batch_imgs, batch_paths = [], []
 
-        # Save as .npy (binary, not text)
-        np.save(op_filepath, image_embeds[0].cpu().numpy())
+with tqdm(total=len(all_pairs), file=sys.stdout) as pbar:
+    for ip_filepath, op_filepath in all_pairs:
+        try:
+            img = Image.open(str(ip_filepath)).convert("RGB")
+        except Exception as e:
+            print(f"Skipping {ip_filepath}: {e}")
+            continue
 
-        pbar.update(1)
+        batch_imgs.append(img)
+        batch_paths.append(op_filepath)
+
+        if len(batch_imgs) == BATCH_SIZE:
+            process_batch(batch_imgs, batch_paths)
+            pbar.update(len(batch_imgs))
+            batch_imgs, batch_paths = [], []
+
+    # flush remaining
+    if batch_imgs:
+        process_batch(batch_imgs, batch_paths)
+        pbar.update(len(batch_imgs))
+
+print("Done.")
