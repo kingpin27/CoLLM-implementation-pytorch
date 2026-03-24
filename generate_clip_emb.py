@@ -19,7 +19,7 @@ device = (
 print(f"Using device: {device}")
 
 # Load model and processor
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to("device")
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 IMAGES_FOLDER_PATH = "./images"
@@ -51,9 +51,6 @@ for folder in folders:
             k: v.to(device)
             for k, v in processor(images=image, return_tensors="pt").items()
         }
-
-        # Process and get embedding (missing return_tensors)
-        inputs = processor(images=image, return_tensors="pt")
 
         with torch.no_grad():
             image_embeds = model.get_image_features(**inputs)  # (1, 512)
