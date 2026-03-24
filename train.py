@@ -1,606 +1,430 @@
-import torch
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-import pandas as pd
+import json
+import logging
 import os
+import sys
+from datetime import datetime
+
+import numpy as np
+import torch
 from PIL import Image
 from torch.nn import functional as F
-from transformers import AutoModelForMultimodalLM , AutoProcessor
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
+from transformers import (
+    AutoModelForMultimodalLM,
+    AutoProcessor,
+    get_linear_schedule_with_warmup,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+LOGGER = logging.getLogger("train2")
+device = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.mps.is_available()
+    else "cpu"
+)  # only run this on nvidia hardware
+
+LOGGER.info(f"accelerator type: {device}")
+
+# FIX 1 (OOM): Tell PyTorch's allocator to use expandable segments
+# to reduce fragmentation before we even start.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+
+def tensor_shape(tensor):
+    return tuple(tensor.shape)
 
 
 class MTCIRDataset(Dataset):
-    def __init__(self, annotations_file, img_dir, transform=None, target_transform=None):
-        self.examples = pd.read_json(annotations_file, lines=True)
+    def __init__(
+        self, annotations_file, img_dir, emb_dir, transform=None, target_transform=None
+    ):
         self.img_dir = img_dir
+        self.emb_dir = emb_dir
+        self.annotations_file = annotations_file
+        self.offsets = []
+
+        with open(self.annotations_file, "r", encoding="utf-8") as f:
+            while True:
+                offset = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                if line.strip():
+                    self.offsets.append(offset)
+
         self.transform = transform
         self.target_transform = target_transform
 
     def __len__(self):
-        return len(self.examples)
-    
-    def __getitem__(self, idx):
-        sample = self.examples.iloc[idx]
+        return len(self.offsets)
 
-        source_path = os.path.join(self.img_dir, sample["image"])
-        target_path = os.path.join(self.img_dir, sample["target_image"])
+    def _read_record(self, idx):
+        with open(self.annotations_file, "r", encoding="utf-8") as f:
+            f.seek(self.offsets[idx])
+            line = f.readline()
+        return json.loads(line)
+
+    def __getitem__(self, idx):
+        record = self._read_record(idx)
+        source_path = os.path.join(self.img_dir, record["image"])
+        # target_path = os.path.join(self.img_dir, record["target_image"])
 
         source_image = Image.open(source_path).convert("RGB")
-        target_image = Image.open(target_path).convert("RGB")
+        # target_image = Image.open(target_path).convert("RGB")
+
+        target_image_emb = np.load(
+            os.path.join(self.emb_dir, record["target_image"][:-4] + ".npy")
+        )
 
         if self.transform is not None:
             source_image = self.transform(source_image)
-        if self.target_transform is not None:
-            target_image = self.target_transform(target_image)
-
-        modifications = sample["modifications"]
 
         return {
-            "id": sample["id"],
+            "id": record["id"],
             "image": source_image,
-            "target_image": target_image,
-            "modification_text": modifications[0]
+            "target_image_emb": target_image_emb,
+            "modification_text": (
+                record["modifications"][0]
+                if isinstance(record.get("modifications"), list)
+                and len(record["modifications"]) > 0
+                else record.get("modifications", "")
+            ),
         }
+
 
 class CoLLM(torch.nn.Module):
     def __init__(
         self,
-        model_name="Qwen/Qwen3.5-2B",
-        freeze_patterns=None,
-        trainable_patterns=None,
-        remove_output_projection_layer=True,
-        output_projection_name=None,
-        disable_last_layers=None,
-        llm_block_path=None,
-        llm_trainable_last_layers=None,
-        projection_dim=None,
-        projection_in_features=None,
-        projection_dropout=0.0,
-        projection_dtype=None,
-        projection_device=None,
+        model_name="Qwen/Qwen3.5-0.8B",
+        projection_dim=512,
+        num_embeddings=4,
+        hidden_dim=512,
     ):
         super().__init__()
-        self.model_name = model_name  # or "Qwen/Qwen3.5-9B-Instruct"
+        self.projection_dim = projection_dim
+        self.model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        self.num_embeddings = num_embeddings
 
-        # Load tokenizer and model.
-        # self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
         self.model = AutoModelForMultimodalLM.from_pretrained(
-            self.model_name,
-            torch_dtype="auto",
-            device_map="auto",
-            trust_remote_code=True
-        )
-        self.projection = None
-        self.output_projection_path = None
-        self.output_projection_backup = None
+            model_name,
+            dtype=self.model_dtype,
+            trust_remote_code=True,
+            # attn_implementation="flash_attention_2",
+        ).to(device)
 
-        if remove_output_projection_layer:
-            self.remove_last_projection_layer(output_projection_name=output_projection_name)
-
-        if projection_dim is not None:
-            self.add_projection_layer(
-                projection_in_features=projection_in_features,
-                projection_out_features=projection_dim,
-                dropout=projection_dropout,
-                projection_dtype=projection_dtype,
-                projection_device=projection_device,
-            )
-
-        if disable_last_layers is not None and disable_last_layers > 0:
-            self.disable_end_layers(num_layers=disable_last_layers, llm_block_path=llm_block_path)
-
-        if llm_trainable_last_layers is not None and llm_trainable_last_layers > 0:
-            self.make_last_llm_layers_trainable(
-                num_layers=llm_trainable_last_layers,
-                llm_block_path=llm_block_path,
-            )
-
-        if freeze_patterns is not None:
-            self.freeze_modules(freeze_patterns)
-
-        if trainable_patterns is not None:
-            self.set_trainable_modules(trainable_patterns)
-
-    def _is_iterable(self, value):
-        return isinstance(value, (list, tuple, set))
-
-    def _normalize_patterns(self, patterns):
-        if patterns is None:
-            return []
-        if isinstance(patterns, str):
-            return [patterns]
-        return list(patterns)
-
-    def freeze_all(self):
-        """Freeze all model parameters."""
-        for _, param in self.named_parameters():
-            param.requires_grad = False
-
-    def unfreeze_all(self):
-        """Unfreeze all model parameters."""
-        for _, param in self.named_parameters():
-            param.requires_grad = True
-
-    def freeze_modules(self, module_patterns):
-        """
-        Freeze all parameters whose names contain any pattern.
-        Example: ["vision_tower", "vision_model"].
-        """
-        patterns = self._normalize_patterns(module_patterns)
-        for name, param in self.named_parameters():
-            if any(pattern in name for pattern in patterns):
-                param.requires_grad = False
-
-    def set_trainable_modules(self, module_patterns, strict=True):
-        """
-        Keep only matching modules trainable. If strict=True, everything else is frozen.
-        If strict=False, matching modules are set trainable and others remain unchanged.
-        """
-        patterns = self._normalize_patterns(module_patterns)
-        if strict:
-            self.freeze_all()
-        for name, param in self.named_parameters():
-            if any(pattern in name for pattern in patterns):
-                param.requires_grad = True
-        return self.get_trainable_param_names()
-
-    def get_trainable_param_names(self):
-        return [name for name, param in self.named_parameters() if param.requires_grad]
-
-    def get_trainable_parameters(self):
-        return [param for _, param in self.named_parameters() if param.requires_grad]
-
-    def disable_end_layers(self, num_layers, llm_block_path=None):
-        """
-        Backward-compatible alias for remove_end_layers().
-        """
-        return self.remove_end_layers(num_layers=num_layers, llm_block_path=llm_block_path)
-
-    def remove_end_layers(self, num_layers, llm_block_path=None):
-        """
-        Remove the last `num_layers` transformer layers from the language model.
-        """
-        layer_path, layer_block = self._find_llm_layer_block(llm_block_path)
-        if layer_block is None:
-            raise ValueError(
-                "Could not find transformer layers block. "
-                f"Pass a valid llm_block_path (for example: '{llm_block_path}')."
-            )
-
-        num_layers = min(num_layers, len(layer_block))
-        if num_layers <= 0:
-            return []
-
-        keep_count = len(layer_block) - num_layers
-        removed_indices = list(range(keep_count, len(layer_block)))
-        self._set_submodule(
-            layer_path,
-            torch.nn.ModuleList(list(layer_block.children())[:keep_count]),
-        )
-        return removed_indices
-
-    def make_last_llm_layers_trainable(self, num_layers, llm_block_path=None):
-        """
-        Freeze all parameters, then unfreeze only the last `num_layers` LLM layers.
-        """
-        self.freeze_all()
-        layer_path, layer_block = self._find_llm_layer_block(llm_block_path)
-        if layer_block is None:
-            raise ValueError(
-                "Could not find transformer layers block. "
-                f"Pass a valid llm_block_path (for example: '{llm_block_path}')."
-            )
-
-        num_layers = max(0, num_layers)
-        if num_layers == 0:
-            return []
-
-        if num_layers >= len(layer_block):
-            for _, param in layer_block.named_parameters():
-                param.requires_grad = True
-            return [f"{layer_path}.{idx}" for idx in range(len(layer_block))]
-
-        start = len(layer_block) - num_layers
-        trainable_layer_indices = []
-        for layer_idx in range(start, len(layer_block)):
-            for name, param in layer_block[layer_idx].named_parameters():
-                param.requires_grad = True
-            trainable_layer_indices.append(f"{layer_path}.{layer_idx}")
-        return trainable_layer_indices
-
-    def _find_llm_layer_block(self, llm_block_path=None):
-        """
-        Find a plausible ModuleList/Sequential containing LLM transformer layers.
-        """
-        candidates = [
-            llm_block_path,
-            "language_model.model.layers",
-            "language_model.model.blocks",
-            "language_model.transformer.h",
-            "language_model.transformer.layers",
-            "language_model.blocks",
-            "transformer.h",
-            "transformer.layers",
-            "transformer.blocks",
-            "model.language_model.layers",
-            "model.language_model.blocks",
-            "model.transformer.h",
-            "model.layers",
-            "model.blocks",
+        for p in self.model.model.visual.parameters():
+            p.requires_grad = False
+        keep_layers = 20
+        self.model.model.language_model.layers = self.model.model.language_model.layers[
+            :keep_layers
         ]
-        for path in candidates:
-            if path is None:
-                continue
-            try:
-                module = self._get_submodule(path)
-            except AttributeError:
-                continue
-            if isinstance(module, (torch.nn.ModuleList, torch.nn.Sequential)) and len(module) > 0:
-                return path, module
+        self.model.lm_head = None
 
-        # Fallback: pick the largest Layer/Block-like sequential module under model.
-        fallback_path = None
-        fallback_len = 0
-        fallback_module = None
-        for name, module in self.model.named_modules():
-            if name == "":
-                continue
-            if not isinstance(module, (torch.nn.ModuleList, torch.nn.Sequential)):
-                continue
-            if len(module) < 2:
-                continue
-            if ".layer" not in name and ".layers" not in name and ".h" not in name and ".block" not in name:
-                continue
-            if len(module) > fallback_len:
-                fallback_path = name
-                fallback_len = len(module)
-                fallback_module = module
-        return fallback_path, fallback_module
-
-    def _get_submodule(self, module_path):
-        module = self.model
-        for key in module_path.split("."):
-            module = getattr(module, key)
-        return module
-
-    def _set_submodule(self, module_path, module_obj):
-        parent = self.model
-        keys = module_path.split(".")
-        for key in keys[:-1]:
-            parent = getattr(parent, key)
-        setattr(parent, keys[-1], module_obj)
-
-    def _collect_projection_candidates(self):
-        candidates = []
-        for name, module in self.model.named_modules():
-            if isinstance(module, torch.nn.Linear):
-                candidates.append((name, module))
-        return candidates
-
-    def remove_last_projection_layer(self, output_projection_name=None):
-        if output_projection_name is not None:
-            try:
-                module = self._get_submodule(output_projection_name)
-            except AttributeError as exc:
-                raise ValueError(f"Projection module '{output_projection_name}' not found.") from exc
-            if not isinstance(module, torch.nn.Linear):
-                raise ValueError(f"'{output_projection_name}' is not a Linear layer.")
-            self.output_projection_backup = module
-            self.output_projection_path = output_projection_name
-            self._set_submodule(output_projection_name, torch.nn.Identity())
-            return output_projection_name
-
-        # Qwen variants commonly keep the final language-head at `lm_head`.
-        direct_candidates = [
-            "lm_head",
-            "language_model.lm_head",
-            "model.lm_head",
-        ]
-        for name in direct_candidates:
-            try:
-                module = self._get_submodule(name)
-                if isinstance(module, torch.nn.Linear):
-                    self.output_projection_backup = module
-                    self.output_projection_path = name
-                    self._set_submodule(name, torch.nn.Identity())
-                    return name
-            except AttributeError:
-                continue
-
-        # Fallback: replace the last Linear layer that maps to vocab size, if present.
-        vocab_size = getattr(self.model.config, "vocab_size", None)
-        projection_like = [
-            (name, module)
-            for name, module in self._collect_projection_candidates()
-            if vocab_size is not None and module.weight.shape[0] == vocab_size
-        ]
-        if projection_like:
-            name, module = projection_like[-1]
-            self.output_projection_backup = module
-            self.output_projection_path = name
-            self._set_submodule(name, torch.nn.Identity())
-            return name
-
-        # Last resort: remove the last Linear layer in the model graph.
-        linear_layers = self._collect_projection_candidates()
-        if linear_layers:
-            name, module = linear_layers[-1]
-            self.output_projection_backup = module
-            self.output_projection_path = name
-            self._set_submodule(name, torch.nn.Identity())
-            return name
-
-        raise ValueError(
-            "Could not identify an output projection layer. "
-            "Pass output_projection_name explicitly."
+        self.cls_probes = torch.nn.Parameter(
+            torch.randn(num_embeddings, hidden_dim, dtype=self.model_dtype)
+        )
+        self.probe_proj = torch.nn.Linear(
+            hidden_dim,
+            projection_dim,
+            dtype=self.model_dtype,
         )
 
-    def restore_last_projection_layer(self):
-        if self.output_projection_path is None or self.output_projection_backup is None:
-            raise ValueError("No removed projection layer to restore.")
-        self._set_submodule(self.output_projection_path, self.output_projection_backup)
-        path = self.output_projection_path
-        self.output_projection_path = None
-        self.output_projection_backup = None
-        return path
+    def make_inputs(self, processor, image, text):
+        if not isinstance(image, (list, tuple)):
+            image = [image]
+        if isinstance(text, str):
+            text = [text]
+        elif not isinstance(text, (list, tuple)):
+            text = [str(text)]
+        if len(image) != len(text):
+            raise ValueError("Number of images and texts must match for batching.")
 
-    def _infer_projection_in_features(self):
-        config = getattr(self.model, "config", None)
-        if config is None:
-            return None
-        for key in ["hidden_size", "d_model", "embed_dim"]:
-            if hasattr(config, key):
-                return getattr(config, key)
-        text_cfg = getattr(config, "text_config", None)
-        if text_cfg is not None:
-            for key in ["hidden_size", "d_model", "embed_dim"]:
-                if hasattr(text_cfg, key):
-                    return getattr(text_cfg, key)
-        vision_cfg = getattr(config, "vision_config", None)
-        if vision_cfg is not None:
-            for key in ["hidden_size", "d_model", "embed_dim"]:
-                if hasattr(vision_cfg, key):
-                    return getattr(vision_cfg, key)
-        return None
-
-    def _infer_projection_dtype(self):
-        ref_param = next(self.model.parameters(), None)
-        if ref_param is None:
-            return torch.float32
-        return ref_param.dtype
-
-    def _infer_projection_device(self):
-        ref_param = next(self.model.parameters(), None)
-        if ref_param is None:
-            return torch.device("cpu")
-        return ref_param.device
-
-    def encode(
-        self,
-        processor_inputs,
-        return_attention_mask=True,
-        with_projection=True,
-    ):
-        outputs = self.model(
-            **processor_inputs,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        token_embeddings = outputs.hidden_states[-1]
-        attention_mask = processor_inputs.get("attention_mask") if return_attention_mask else None
-
-        if with_projection and self.projection is not None:
-            token_embeddings = self.projection(token_embeddings)
-        return token_embeddings, attention_mask
-
-    @staticmethod
-    def late_interaction_score(query_embeddings, query_mask, doc_embeddings, doc_mask):
-        query_embeddings = F.normalize(query_embeddings, dim=-1)
-        doc_embeddings = F.normalize(doc_embeddings, dim=-1)
-
-        batch_size = query_embeddings.size(0)
-        scores = torch.empty((batch_size, batch_size), device=query_embeddings.device, dtype=query_embeddings.dtype)
-
-        for i in range(batch_size):
-            q_len = query_embeddings.size(1) if query_mask is None else int(query_mask[i].sum().item())
-            q = query_embeddings[i, :q_len]
-
-            for j in range(batch_size):
-                d_len = doc_embeddings.size(1) if doc_mask is None else int(doc_mask[j].sum().item())
-                d = doc_embeddings[j, :d_len]
-
-                if q_len == 0 or d_len == 0:
-                    scores[i, j] = 0.0
-                    continue
-
-                sim = q @ d.t()
-                scores[i, j] = sim.max(dim=1).values.sum()
-
-        return scores
-
-    def add_projection_layer(
-        self,
-        projection_in_features=None,
-        projection_out_features=None,
-        dropout=0.0,
-        freeze_projection=True,
-        replace_existing=False,
-        projection_dtype=None,
-        projection_device=None,
-    ):
-        """
-        Attach a linear projection head for extending model outputs.
-        projection_out_features is required.
-        """
-        if projection_out_features is None:
-            raise ValueError("projection_out_features is required to add a projection layer.")
-
-        if projection_in_features is None:
-            projection_in_features = self._infer_projection_in_features()
-            if projection_in_features is None:
-                raise ValueError(
-                    "Could not infer projection input features. "
-                    "Pass projection_in_features explicitly."
-                )
-
-        if self.projection is not None and not replace_existing:
-            raise ValueError("Projection layer already exists. Set replace_existing=True to recreate it.")
-
-        if projection_dtype is None:
-            projection_dtype = self._infer_projection_dtype()
-        if projection_device is None:
-            projection_device = self._infer_projection_device()
-
-        self.projection = torch.nn.Sequential(
-            torch.nn.Dropout(p=dropout),
-            torch.nn.Linear(
-                projection_in_features,
-                projection_out_features,
-                device=projection_device,
-                dtype=projection_dtype,
-            ),
-        )
-        self.projection_dropout = dropout
-        self.projection_in_features = projection_in_features
-        self.projection_out_features = projection_out_features
-
-        if freeze_projection:
-            self.freeze_modules(["projection"])
-
-        return self.projection
-
-
-def build_contrastive_inputs(processor, images, texts):
-    messages = []
-    for text in texts:
-        messages.append(
+        messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": text},
+                    {"type": "text", "text": str(t)},
                 ],
             }
+            for t in text
+        ]
+        rendered = []
+        for m in messages:
+            if not isinstance(m, dict):
+                raise TypeError(
+                    f"Expected message dict for chat template, got {type(m)}"
+                )
+            rendered.append(
+                processor.apply_chat_template(
+                    [m],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
+        enc = processor(
+            text=rendered,
+            images=list(image),
+            return_tensors="pt",
+            padding=True,
         )
-    rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    return processor(
-        text=rendered,
-        images=images,
-        return_tensors="pt",
-        padding=True,
-    )
+        return {k: v.to(device) for k, v in enc.items()}
+
+    def forward(self, images, text, processor):
+        inputs = self.make_inputs(processor, images, text)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            outputs = self.model.model(
+                **inputs, output_hidden_states=True, return_dict=True
+            )
+        hidden = outputs.hidden_states[-1]  # cast OUT of fp16 immediately
+        mask = inputs["attention_mask"].to(torch.bfloat16)  # (B, S)
+
+        scores = torch.matmul(
+            self.cls_probes.unsqueeze(0),  # (1, K, H)
+            hidden.transpose(1, 2),  # (B, H, S)
+        )  # (B, K, S)
+
+        scores = scores.masked_fill(mask.unsqueeze(1) == 0, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)  # (B, K, S)
+        pooled = torch.matmul(attn, hidden)  # (B, K, H)
+
+        embeddings = self.probe_proj(pooled)  # (B, K, projection_dim)
+        embeddings = F.normalize(embeddings, dim=-1)
+        return embeddings
 
 
 def collm_contrastive_collate_fn(batch):
     return {
         "id": [item["id"] for item in batch],
         "image": [item["image"] for item in batch],
-        "target_image": [item["target_image"] for item in batch],
+        "target_image_emb": [item["target_image_emb"] for item in batch],  # fixed key
         "modification_text": [item["modification_text"] for item in batch],
     }
 
 
-def save_collm_checkpoint(collm, processor, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    # Save base Qwen model safely (required for reloading by Auto classes).
-    collm.model.save_pretrained(output_dir)
-    # Save custom projection + training flags from the wrapper.
-    torch.save(collm.state_dict(), os.path.join(output_dir, "collm_wrapper.pt"))
-    # Save processor for full reproducibility.
-    processor.save_pretrained(output_dir)
+def log_vram(label=""):
+    if device != "cuda":
+        return
+    allocated = torch.cuda.max_memory_allocated() / 1e9
+    reserved = torch.cuda.max_memory_reserved() / 1e9
+    LOGGER.info(
+        f"VRAM [{label}] peak allocated={allocated:.2f}GB  reserved={reserved:.2f}GB"
+    )
+    torch.cuda.reset_peak_memory_stats()  # reset so next window is fresh
 
 
-def train_contrastive(
-    collm,
-    processor,
-    dataloader,
-    epochs=1,
-    temperature=0.07,
-    lr=1e-4,
-    device="cpu",
-    save_output_dir=None,
-    save_every_epoch=False,
-):
-    model = collm.to(device)
-    optimizer = torch.optim.AdamW(model.get_trainable_parameters(), lr=lr)
+def param_summary(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
 
-    model.train()
+    def fmt(n):
+        if n >= 1e9:
+            return f"{n / 1e9:.2f}B"
+        if n >= 1e6:
+            return f"{n / 1e6:.2f}M"
+        if n >= 1e3:
+            return f"{n / 1e3:.2f}K"
+        return str(n)
+
+    LOGGER.info(f"Total      : {fmt(total):>10}  ({total:,})")
+    LOGGER.info(f"Trainable  : {fmt(trainable):>10}  ({trainable:,})")
+    LOGGER.info(f"Frozen     : {fmt(frozen):>10}  ({frozen:,})")
+
+
+def main():
+    processor_name = "Qwen/Qwen3.5-0.8B"
+    model_name = "Qwen/Qwen3.5-0.8B"
+    projection_dim = 512  # same as CLIP-B = P
+    num_embeddings = 4  # num of target proposals = K
+    hidden_dim = 1024
+
+    # Temperature for soft probe selection — lower = closer to hard argmax.
+    # Can be annealed toward 0 over training for increasingly competitive probes.
+    probe_temperature = 1
+    # Temperature for InfoNCE contrastive loss.
+    # 0.07 (CLIP default) is aggressive early in training; 0.1 is safer to start.
+    infonce_temperature = 0.3
+    diversity_weight = 0.1
+
+    epochs = 1
+    batch_size = 128  # = B
+    num_workers = 8
+    num_batches = int((1024 * 1024) / batch_size)
+
+    LOGGER.info("Loading processor: %s", processor_name)
+    processor = AutoProcessor.from_pretrained(processor_name, trust_remote_code=True)
+    LOGGER.info("Processor loaded")
+
+    LOGGER.info("Loading model: %s", model_name)
+    model = CoLLM(
+        model_name=model_name,
+        projection_dim=projection_dim,
+        num_embeddings=num_embeddings,
+        hidden_dim=hidden_dim,
+    )
+    model = model.to(device)
+    # model = torch.compile(model, mode="reduce-overhead")
+    param_summary(model)
+    LOGGER.info("Model loaded and ready")
+
+    model.model.model.language_model.gradient_checkpointing_enable()
+    model.model.model.language_model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+    LOGGER.info("Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled.jsonl")
+    train_dataset = MTCIRDataset(
+        "./MTCIR/mtcir_expanded_shuffled.jsonl",
+        "./images",
+        "./embeddings",
+    )
+    LOGGER.info("Dataset ready with %d samples", len(train_dataset))
+    LOGGER.info(
+        "Creating DataLoader batch_size=%d, num_workers=%d", batch_size, num_workers
+    )
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        multiprocessing_context="spawn",
+        pin_memory=False,
+        collate_fn=collm_contrastive_collate_fn,
+        shuffle=True,
+    )
+
+    LOGGER.info("Initializing optimizer (AdamW, lr=1e-4)")
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    LOGGER.info("Optimizer will update %d parameter tensors", len(trainable_params))
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, eps=1e-6)
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=500,
+        num_training_steps=num_batches * 5,  # so only decays lr to 80%
+    )
+
+    LOGGER.info("Starting training for %d epoch(s)", epochs)
+    LOGGER.info("Training on total exmaples: %d", num_batches * batch_size)
+
+    skipped = 0
     for epoch in range(epochs):
-        total_loss = 0.0
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False):
-            query_texts = [f"Describe the image with modifications- {t}" for t in batch["modification_text"]]
-            doc_texts = [f"Describe the image" for _ in batch["modification_text"]]
-
-            query_inputs = build_contrastive_inputs(processor, batch["image"], query_texts)
-            doc_inputs = build_contrastive_inputs(processor, batch["target_image"], doc_texts)
-
-            query_inputs = {key: value.to(device) for key, value in query_inputs.items()}
-            doc_inputs = {key: value.to(device) for key, value in doc_inputs.items()}
-
-            q_embeddings, q_mask = model.encode(query_inputs)
-            d_embeddings, d_mask = model.encode(doc_inputs)
-
-            logits = CoLLM.late_interaction_score(q_embeddings, q_mask, d_embeddings, d_mask) / temperature
-            targets = torch.arange(logits.size(0), device=device)
-            loss = F.cross_entropy(logits, targets)
-
+        LOGGER.info("Running epoch %d/%d", epoch + 1, epochs)
+        pbar = tqdm(
+            total=num_batches,
+            file=sys.stdout,
+            leave=False,
+        )
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx >= num_batches:
+                break
+            model.train()
             optimizer.zero_grad()
+
+            # forwars pass
+            embeddings = model.forward(
+                images=batch["image"],
+                text=batch["modification_text"],
+                processor=processor,
+            )  # (B, K, P)
+
+            # Guard: skip batch if backbone produced inf/nan hidden states.
+            # This can happen early in training when fp16 attention overflows.
+            if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+                skipped += 1
+                LOGGER.warning(
+                    "Epoch=%d batch=%d | bad embeddings (nan/inf), skipping "
+                    "[total skipped=%d]",
+                    epoch + 1,
+                    batch_idx + 1,
+                    skipped,
+                )
+                scheduler.step()
+                pbar.update(1)
+                continue
+
+            # target embeddings: frozen CLIP vectors, not part of grad graph
+            target_emb = (
+                torch.stack([torch.from_numpy(e) for e in batch["target_image_emb"]])
+                .to(device)
+                .float()
+            )  # (B, P)
+            target_emb = F.normalize(target_emb, dim=-1)  # (B, P)
+
+            # --- soft probe selection (fully differentiable) ---
+            # Similarity of every probe against its own target: (B, K)
+            per_probe_sim = torch.einsum(
+                "bkp,bp->bk", embeddings.float(), target_emb
+            )  # (B, K)
+
+            # Soft convex combination weighted by proximity to target.
+            # Gradient flows to ALL K probes; sharpness controlled by probe_temperature.
+            # As probe_temperature -> 0 this approaches hard argmax.
+            probe_weights = torch.softmax(
+                per_probe_sim / probe_temperature, dim=1
+            )  # (B, K)
+            best_emb = torch.einsum(
+                "bk,bkp->bp", probe_weights, embeddings.float()
+            )  # (B, P) — still unit-norm after softmax combination (approx)
+            best_emb = F.normalize(best_emb, dim=-1)  # re-normalise to be exact
+
+            # --- symmetric InfoNCE loss ---
+            # Logit matrix: each query's composed embedding vs every target in batch.
+            # Diagonal entries are the positives.
+            logits = (
+                torch.matmul(best_emb, target_emb.T) / infonce_temperature
+            )  # (B, B)
+            labels = torch.arange(logits.size(0), device=device)  # (B,)
+
+            # Regularise cls_probes directly — they live in a fixed hidden_dim space
+            probe_gram = torch.mm(
+                F.normalize(model.cls_probes.float(), dim=-1),
+                F.normalize(model.cls_probes.float(), dim=-1).T,
+            )  # (K, K)
+            off_diag = probe_gram.masked_fill(
+                torch.eye(num_embeddings, device=device, dtype=torch.bool), 0.0
+            )
+            diversity_loss = (off_diag**2).sum()
+
+            loss = (
+                F.cross_entropy(logits, labels)  # query -> target
+                + F.cross_entropy(logits.T, labels)  # target -> query
+            ) / 2 + diversity_weight * diversity_loss
+
+            # backward pass
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
-            total_loss += loss.item()
+            scheduler.step()
 
-        if len(dataloader) > 0:
-            print(f"Epoch {epoch + 1}: contrastive loss = {total_loss / len(dataloader):.4f}")
+            pbar.update(1)
 
-        if save_output_dir is not None:
-            if save_every_epoch:
-                epoch_dir = os.path.join(save_output_dir, f"epoch_{epoch+1}")
-                save_collm_checkpoint(model, processor, epoch_dir)
-            else:
-                # Save once after the final epoch in the default output dir.
-                if epoch == epochs - 1:
-                    save_collm_checkpoint(model, processor, save_output_dir)
+            if batch_idx % 10 == 0:
+                LOGGER.info(
+                    "Epoch=%d batch=%d | loss=%.4f | lr=%.2e\n",
+                    epoch + 1,
+                    batch_idx + 1,
+                    loss.item(),
+                    scheduler.get_last_lr()[0],
+                )
+                log_vram(f"epoch={epoch + 1} batch={batch_idx + 1}")
+        pbar.close()
+        log_vram(f"epoch={epoch + 1} end")
 
-    if save_output_dir is not None and not save_every_epoch:
-        # Safety net if dataloader is empty.
-        save_collm_checkpoint(model, processor, save_output_dir)
+    LOGGER.info("saving model to CoLLM.pt")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_filename = f"collm_{timestamp}.pt"
+    torch.save(model.state_dict(), model_filename)
+    LOGGER.info(f"Model saved as: {model_filename}")
 
 
 if __name__ == "__main__":
-    annotations_file = "./MTCIR/mtcir.jsonl"
-    image_dir = "./images"
-    batch_size = 16
-    num_epochs = 1
-
-    device = "mps" if torch.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-    train_dataset = MTCIRDataset(annotations_file=annotations_file, img_dir=image_dir)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=collm_contrastive_collate_fn,
-    )
-
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-2B", trust_remote_code=True)
-    model = CoLLM(
-        model_name="Qwen/Qwen3.5-2B",
-        remove_output_projection_layer=True,
-        projection_dim=768,
-        projection_dropout=0.0,
-        disable_last_layers=4,
-        llm_block_path="model.language_model.layers",
-        llm_trainable_last_layers=10,
-    )
-
-    train_contrastive(
-        collm=model,
-        processor=processor,
-        dataloader=train_loader,
-        epochs=num_epochs,
-        temperature=0.07,
-        lr=1e-4,
-        device=device,
-        save_output_dir="./checkpoints",
-        save_every_epoch=True,
-    )
+    main()
