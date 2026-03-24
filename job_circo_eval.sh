@@ -30,12 +30,6 @@ export HF_HUB_CACHE="$HF_HOME/hub"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 export DIFFUSERS_CACHE="$HF_HOME/diffusers"
 mkdir -p "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE" "$DIFFUSERS_CACHE"
-
-echo "Copying COCO to local scratch..."
-mkdir -p $TMPDIR/coco_unlabeled
-rsync -a --info=progress2 ~/CIRCO/COCO2017_unlabeled/unlabeled2017/ $TMPDIR/coco_unlabeled/
-echo "Done copying."
-
 cd /home/anirban/anishc/CoLLM-implementation-pytorch
 
 start_ts=$(date +%s)
@@ -45,7 +39,7 @@ srun python circo_eval.py \
     --checkpoint ~/CoLLM-implementation-pytorch/collm_0148243.pt \
     --split val \
     --annotations ~/CIRCO/annotations/val.json \
-    --coco-img-dir $TMPDIR/coco_unlabeled  \
+    --coco-img-dir ~/CIRCO/COCO2017_unlabeled/unlabeled2017  \
     --coco-image-info ~/CIRCO/COCO2017_unlabeled/annotations/image_info_unlabeled2017.json \
     --output ~/CIRCO/submission_val.json
 
