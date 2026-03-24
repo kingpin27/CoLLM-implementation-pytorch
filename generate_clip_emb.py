@@ -56,7 +56,7 @@ for folder in folders:
         inputs = processor(images=image, return_tensors="pt")
 
         with torch.no_grad():
-            image_embeds = model.vision_model(**inputs).pooler_output
+            image_embeds = model.get_image_features(**inputs)  # (1, 512)
             image_embeds = F.normalize(image_embeds, p=2, dim=-1)
 
         # Save as .npy (binary, not text)

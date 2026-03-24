@@ -117,7 +117,7 @@ class CoLLM(torch.nn.Module):
             model_name,
             dtype=self.model_dtype,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            # attn_implementation="flash_attention_2",
         ).to(device)
 
         for p in self.model.model.visual.parameters():
@@ -232,7 +232,7 @@ def param_summary(model):
 def main():
     processor_name = "Qwen/Qwen3.5-0.8B"
     model_name = "Qwen/Qwen3.5-0.8B"
-    projection_dim = 768  # same as CLIP-B = P
+    projection_dim = 512  # same as CLIP-B = P
     num_embeddings = 4  # num of target proposals = K
     hidden_dim = 1024
 
@@ -261,7 +261,7 @@ def main():
         hidden_dim=hidden_dim,
     )
     model = model.to(device)
-    model = torch.compile(model, mode="reduce-overhead")
+    # model = torch.compile(model, mode="reduce-overhead")
     param_summary(model)
     LOGGER.info("Model loaded and ready")
 
