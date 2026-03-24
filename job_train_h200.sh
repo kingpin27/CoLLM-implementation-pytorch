@@ -8,6 +8,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
+#SBATCH --qos=h200_qos
 
 set -euo pipefail
 
