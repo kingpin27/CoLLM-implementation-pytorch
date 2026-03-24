@@ -117,11 +117,12 @@ class CoLLM(torch.nn.Module):
             model_name,
             dtype=self.model_dtype,
             trust_remote_code=True,
+            attn_implementation="flash_attention_2",
         ).to(device)
 
         for p in self.model.model.visual.parameters():
             p.requires_grad = False
-        keep_layers = 16
+        keep_layers = 20
         self.model.model.language_model.layers = self.model.model.language_model.layers[
             :keep_layers
         ]
@@ -237,14 +238,14 @@ def main():
 
     # Temperature for soft probe selection — lower = closer to hard argmax.
     # Can be annealed toward 0 over training for increasingly competitive probes.
-    probe_temperature = 0.1
+    probe_temperature = 1
     # Temperature for InfoNCE contrastive loss.
     # 0.07 (CLIP default) is aggressive early in training; 0.1 is safer to start.
-    infonce_temperature = 0.1
+    infonce_temperature = 0.3
     diversity_weight = 0.1
 
     epochs = 1
-    batch_size = 32  # = B
+    batch_size = 128  # = B
     num_workers = 8
     num_batches = int((1024 * 1024) / batch_size)
 
@@ -260,6 +261,7 @@ def main():
         hidden_dim=hidden_dim,
     )
     model = model.to(device)
+    model = torch.compile(model, mode="reduce-overhead")
     param_summary(model)
     LOGGER.info("Model loaded and ready")
 
