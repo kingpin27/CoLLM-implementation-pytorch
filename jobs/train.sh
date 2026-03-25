@@ -63,14 +63,14 @@ echo "Setting up Conda env..."
 ENV_NAME="collm"
 EXPECTED_TORCH="2.4.0+cu124"
 
-# Check if env exists and has the right torch
-if conda env list | grep -qE "^${ENV_NAME}\s"; then
-    ACTUAL_TORCH=$(conda run -n "$ENV_NAME" python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "none")
+PYTHON="/home/anirban/anishc/miniconda3/envs/collm/bin/python"
+EXPECTED_TORCH="2.4.0+cu124"
+
+if [ -f "$PYTHON" ]; then
+    ACTUAL_TORCH=$("$PYTHON" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "none")
     if [[ "$ACTUAL_TORCH" != "$EXPECTED_TORCH" ]]; then
-        echo "Torch mismatch (got $ACTUAL_TORCH, want $EXPECTED_TORCH). Nuking env..."
-        conda env remove -y -n "$ENV_NAME"
-    else
-        echo "Conda env '${ENV_NAME}' OK (torch=$ACTUAL_TORCH)"
+        echo "Torch mismatch ($ACTUAL_TORCH), nuking env..."
+        conda env remove -y -n collm
     fi
 fi
 
