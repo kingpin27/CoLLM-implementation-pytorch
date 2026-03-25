@@ -64,7 +64,7 @@ ENV_NAME="collm"
 EXPECTED_TORCH="2.4.0+cu124"
 
 PYTHON="/home/anirban/anishc/miniconda3/envs/collm/bin/python"
-EXPECTED_TORCH="2.4.0+cu124"
+EXPECTED_TORCH="2.11.0+cu124"
 
 if [ -f "$PYTHON" ]; then
     ACTUAL_TORCH=$("$PYTHON" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "none")
