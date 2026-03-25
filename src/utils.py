@@ -91,10 +91,14 @@ def get_git_info() -> dict:
 
 
 def collm_contrastive_collate_fn(batch):
+    batch = [item for item in batch if item is not None]  # drop failed samples
+    if not batch:
+        return None
+
     return {
         "id": [item["id"] for item in batch],
         "image": [item["image"] for item in batch],
-        "target_image_emb": [item["target_image_emb"] for item in batch],  # fixed key
+        "target_image_emb": [item["target_image_emb"] for item in batch],
         "modification_text": [item["modification_text"] for item in batch],
     }
 

@@ -157,6 +157,7 @@ def main():
         "./MTCIR/mtcir_expanded_shuffled.jsonl",
         "./images",
         "./embeddings",
+        LOGGER=LOGGER,
     )
     LOGGER.info("Dataset ready with %d samples", len(train_dataset))
     LOGGER.info(
@@ -235,6 +236,8 @@ def main():
             except StopIteration:
                 break
         for batch_idx, batch in enumerate(train_loader):
+            if batch is None:
+                continue
             if batch_idx >= NUM_BATCHES:
                 break
             model.train()
