@@ -9,7 +9,7 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor
 
-from train3 import CoLLM  # your model class
+from models import CoLLM  # your model class
 
 # ── device ────────────────────────────────────────────────────────────────────
 device = (
