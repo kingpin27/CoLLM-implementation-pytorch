@@ -61,45 +61,13 @@ export DIVERSITY_WEIGHT=0.1
 # --- Conda env setup ---
 echo "Setting up Conda env..."
 ENV_NAME="collm"
-EXPECTED_TORCH="2.4.0+cu124"
-
-PYTHON="/home/anirban/anishc/miniconda3/envs/collm/bin/python"
-EXPECTED_TORCH="2.11.0+cu124"
-
-if [ -f "$PYTHON" ]; then
-    ACTUAL_TORCH=$("$PYTHON" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "none")
-    if [[ "$ACTUAL_TORCH" != "$EXPECTED_TORCH" ]]; then
-        echo "Torch mismatch ($ACTUAL_TORCH), nuking env..."
-        conda env remove -y -n collm
-    fi
-fi
-
 if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
     echo "Creating conda env '${ENV_NAME}'..."
     conda create -y -n "$ENV_NAME" python=3.10
     conda run -n "$ENV_NAME" \
         bash -c '
-            pip install torch==2.11.0+cu124 torchvision==0.26.0+cu124 \
-            --index-url https://download.pytorch.org/whl/cu124
-
-            echo "--- torch version after initial install ---"
-            pip show torch | grep Version
-
-            pip install ninja packaging setuptools wheel
-            pip install triton
-            pip install flash-linear-attention --no-build-isolation
-            pip install causal-conv1d --no-build-isolation
-
-            echo "--- torch version after fl/causal install ---"
-            pip show torch | grep Version
-
-            echo "torch==2.5.1+cu124" > /tmp/constraints.txt
-            echo "torchvision==0.20.1+cu124" >> /tmp/constraints.txt
-            pip install transformers accelerate diffusers tqdm pillow numpy wandb \
-                -c /tmp/constraints.txt -v 2>&1 | grep -i "torch"
-
-            echo "--- torch version after all installs ---"
-            pip show torch | grep Version
+            pip install torch torchvision
+            pip install transformers accelerate diffusers tqdm pillow numpy wandb
         '
 fi
 conda activate "$ENV_NAME"
