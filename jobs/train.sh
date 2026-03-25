@@ -85,7 +85,9 @@ if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
             pip install triton==3.0.0
             pip install flash-linear-attention==0.3.2 --no-build-isolation
             pip install causal-conv1d --no-build-isolation
-            pip install transformers accelerate diffusers tqdm pillow numpy wandb
+            echo "torch==2.4.0+cu124" > /tmp/constraints.txt
+            pip install transformers accelerate diffusers tqdm pillow numpy wandb \
+            -c /tmp/constraints.txt
         '
     echo "Conda env '${ENV_NAME}' ready."
 fi
