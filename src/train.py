@@ -95,7 +95,9 @@ def main():
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    LOGGER.info("Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled.jsonl")
+    LOGGER.info(
+        "Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled_safe.jsonl"
+    )
     train_dataset = MTCIRDataset(
         "./MTCIR/mtcir_expanded_shuffled.jsonl",
         "./images",
