@@ -23,7 +23,7 @@ from utils import (
     save_checkpoint,
 )
 
-CHECKPOINT_INTERVAL = 1000  # save a checkpoint every N batches
+CHECKPOINT_INTERVAL = 100000  # save a checkpoint every N batches
 CHECKPOINT_DIR = "./checkpoints"
 
 device = (
