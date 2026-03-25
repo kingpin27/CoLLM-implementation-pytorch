@@ -93,8 +93,8 @@ if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
             echo "--- torch version after fl/causal install ---"
             pip show torch | grep Version
 
-            echo "torch==2.4.0+cu124" > /tmp/constraints.txt
-            echo "torchvision==0.19.0+cu124" >> /tmp/constraints.txt
+            echo "torch==2.5.1+cu124" > /tmp/constraints.txt
+            echo "torchvision==0.20.1+cu124" >> /tmp/constraints.txt
             pip install transformers accelerate diffusers tqdm pillow numpy wandb \
                 -c /tmp/constraints.txt -v 2>&1 | grep -i "torch"
 
