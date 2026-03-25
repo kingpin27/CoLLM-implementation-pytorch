@@ -51,14 +51,15 @@ export DIVERSITY_WEIGHT=0.1
 
 # --- Conda env setup ---
 echo "Setting up Conda env..."
-ENV_NAME="collm_env_anishc"
+ENV_NAME="collm_cuda_12_4"
 if conda env list | grep -qE "^${ENV_NAME}\s"; then
     echo "Conda env '${ENV_NAME}' found, activating..."
 else
     echo "Conda env '${ENV_NAME}' not found, creating..."
     conda create -y -n "$ENV_NAME" python=3.12
     conda run -n "$ENV_NAME" pip install \
-        torch torchvision \
+        torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
+        && conda run -n "$ENV_NAME" pip install \
         flash-linear-attention causal-conv1d \
         transformers accelerate \
         diffusers \
