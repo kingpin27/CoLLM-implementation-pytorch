@@ -15,4 +15,4 @@ echo "Node: $(hostname)"
 cd /home/anirban/anishc/CoLLM-implementation-pytorch
 
 
-python3 scripts/create_safe_mtcir.py -i ./MTCIR/mtcir_expanded_shuffled.jsonl -o ./MTCIR/mtcir_expanded_shuffled_safe.jsonl --seed 42 -l 100
+python3 scripts/create_safe_mtcir.py -i ./MTCIR/mtcir_expanded_shuffled.jsonl -o ./MTCIR/mtcir_expanded_shuffled_safe.jsonl -l 100
