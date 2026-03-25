@@ -21,7 +21,7 @@ module load cuda/12.4
 source /home/anirban/anishc/miniconda3/etc/profile.d/conda.sh
 conda activate collm3
 
-pip install torch torchvision tqdm pillow numpy wandb transformers accelerate
+pip install torch torchvision tqdm pillow numpy wandb transformers accelerate --no-cache-dir
 
 # only after first run
 # echo "Setting up HF offline..."
