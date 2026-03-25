@@ -1,6 +1,65 @@
+import glob
+import os
 import subprocess
 
 import torch
+
+
+def save_checkpoint(
+    experiment_id,
+    epoch,
+    batch_idx,
+    model,
+    optimizer,
+    scheduler,
+    skipped,
+    CHECKPOINT_DIR,
+    LOGGER,
+):
+    """Save full training state so a run can be resumed exactly."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    path = os.path.join(
+        CHECKPOINT_DIR,
+        f"collm_{experiment_id}_epoch{epoch}_batch{batch_idx}.ckpt",
+    )
+    torch.save(
+        {
+            "experiment_id": experiment_id,
+            "epoch": epoch,
+            "batch_idx": batch_idx,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "skipped": skipped,
+        },
+        path,
+    )
+    LOGGER.info("Checkpoint saved: %s", path)
+    return path
+
+
+def find_latest_checkpoint(experiment_id, CHECKPOINT_DIR):
+    """
+    Scan CHECKPOINT_DIR for all checkpoints belonging to experiment_id and
+    return the path of the one with the highest (epoch, batch_idx), or None.
+    """
+    pattern = os.path.join(CHECKPOINT_DIR, f"collm_{experiment_id}_epoch*_batch*.ckpt")
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return None
+
+    def _rank(p):
+        # Extract epoch and batch numbers from filename for sorting.
+        base = os.path.basename(p)  # collm_<id>_epoch<E>_batch<B>.ckpt
+        try:
+            parts = base.replace(".ckpt", "").split("_")
+            epoch = int(next(p for p in parts if p.startswith("epoch"))[5:])
+            batch = int(next(p for p in parts if p.startswith("batch"))[5:])
+            return (epoch, batch)
+        except Exception:
+            return (-1, -1)
+
+    return max(candidates, key=_rank)
 
 
 def get_git_info() -> dict:

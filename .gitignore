@@ -6,3 +6,4 @@ embeddings
 *.out
 *.err
 __pycache__
+checkpoints

@@ -51,22 +51,24 @@ export PROBE_TEMP=1
 export INFONCE_TEMP=0.1
 export DIVERSITY_WEIGHT=0.1
 
+# echo "resuming previous experiment..."
+# export EXPERIMENT_ID=adsasd
+
 # --- Conda env setup ---
 echo "Setting up Conda env..."
-ENV_NAME="collm_fix"
+ENV_NAME="collm"
 if conda env list | grep -qE "^${ENV_NAME}\s"; then
     echo "Conda env '${ENV_NAME}' found, activating..."
 else
     echo "Conda env '${ENV_NAME}' not found, creating..."
     conda create -y -n "$ENV_NAME" python=3.12
-    conda run -n "$ENV_NAME" pip install \
-        torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu124 \
-        && conda run -n "$ENV_NAME" pip install \
-        flash-linear-attention \
-        causal-conv1d \
-        transformers accelerate \
-        diffusers \
-        tqdm pillow numpy wandb
+    conda run -n "$ENV_NAME" \
+        bash -c '
+            export PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124
+            pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+            pip install ninja  # speeds up compilation significantly
+            pip install flash-linear-attention causal-conv1d transformers accelerate diffusers tqdm pillow numpy wandb
+        '
     echo "Conda env '${ENV_NAME}' created and packages installed"
 fi
 conda activate "$ENV_NAME"

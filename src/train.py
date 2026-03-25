@@ -14,7 +14,17 @@ from transformers.optimization import get_linear_schedule_with_warmup
 from dataset import MTCIRDataset
 from logger import LOGGER
 from models import CoLLM
-from utils import collm_contrastive_collate_fn, get_git_info, log_vram, param_summary
+from utils import (
+    collm_contrastive_collate_fn,
+    find_latest_checkpoint,
+    get_git_info,
+    log_vram,
+    param_summary,
+    save_checkpoint,
+)
+
+CHECKPOINT_INTERVAL = 1000  # save a checkpoint every N batches
+CHECKPOINT_DIR = "./checkpoints"
 
 device = (
     "cuda"
@@ -56,11 +66,25 @@ def main():
     NUM_WORKERS = int(os.getenv("NUM_WORKERS", 8))
     NUM_BATCHES = int(os.getenv("NUM_BATCHES", (1024 * 128) // BATCH_SIZE))
 
+    # ------------------------------------------------------------------
+    # Checkpoint resume: look for an existing checkpoint only when
+    # EXPERIMENT_ID was explicitly provided by the caller.  A freshly
+    # generated UUID never has a matching checkpoint.
+    # ------------------------------------------------------------------
+    resume_epoch = 0
+    resume_batch = 0  # first batch_idx to process in the resumed epoch
+    skipped = 0
+
+    resume_ckpt_path = None
+    if os.getenv("EXPERIMENT_ID"):  # only attempt resume on explicit IDs
+        resume_ckpt_path = find_latest_checkpoint(experiment_id, CHECKPOINT_DIR)
+
     run = wandb.init(
         # Set the wandb entity where your project will be logged (generally your team name).
         entity="anishchaudhary2706-indian-institute-of-science",
         # Set the wandb project where this run will be logged.
         project=f"collm-{experiment_id}",
+        resume="allow" if resume_ckpt_path else None,
         # Track hyperparameters and run metadata.
         config={
             # Identifiers
@@ -159,6 +183,28 @@ def main():
         num_warmup_steps=500,
         num_training_steps=NUM_BATCHES * 5,  # so only decays lr to 80%
     )
+    # ------------------------------------------------------------------
+    # Restore checkpoint state (model weights, optimizer, scheduler, etc.)
+    # Must happen *after* model + optimizer + scheduler are constructed.
+    # ------------------------------------------------------------------
+    if resume_ckpt_path:
+        LOGGER.info("Resuming from checkpoint: %s", resume_ckpt_path)
+        ckpt = torch.load(resume_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        resume_epoch = ckpt["epoch"]
+        # resume_batch is the *next* batch to run, i.e. one past the saved one
+        resume_batch = ckpt["batch_idx"] + 1
+        skipped = ckpt.get("skipped", 0)
+        LOGGER.info(
+            "Resumed state: epoch=%d, next_batch=%d, skipped_so_far=%d",
+            resume_epoch,
+            resume_batch,
+            skipped,
+        )
+    else:
+        LOGGER.info("Starting fresh training run")
 
     LOGGER.info("Starting training for %d epoch(s)", EPOCHS)
     LOGGER.info("Training on total exmaples: %d", NUM_BATCHES * BATCH_SIZE)
@@ -166,11 +212,28 @@ def main():
     skipped = 0
     for epoch in range(EPOCHS):
         LOGGER.info("Running epoch %d/%d", epoch + 1, EPOCHS)
+        # On the resumed epoch we fast-forward the dataloader by skipping
+        # batches that were already processed.  On all subsequent epochs we
+        # start from batch 0 as normal.
+        start_batch = resume_batch if epoch == resume_epoch else 0
+        if start_batch > 0:
+            LOGGER.info(
+                "Fast-forwarding dataloader: skipping first %d batches", start_batch
+            )
+
         pbar = tqdm(
-            total=NUM_BATCHES,
+            total=NUM_BATCHES - start_batch,
             file=sys.stdout,
             leave=False,
         )
+        loader_iter = iter(train_loader)
+
+        # Consume (but don't train on) the already-processed batches.
+        for _ in range(start_batch):
+            try:
+                next(loader_iter)
+            except StopIteration:
+                break
         for batch_idx, batch in enumerate(train_loader):
             if batch_idx >= NUM_BATCHES:
                 break
@@ -260,6 +323,23 @@ def main():
                 }
             )
 
+            # ----------------------------------------------------------
+            # Periodic checkpoint (every CHECKPOINT_INTERVAL batches)
+            # batch_idx is 0-based, so we trigger at 999, 1999, …
+            # ----------------------------------------------------------
+            if (batch_idx + 1) % CHECKPOINT_INTERVAL == 0:
+                save_checkpoint(
+                    experiment_id,
+                    epoch,
+                    batch_idx,
+                    model,
+                    optimizer,
+                    scheduler,
+                    skipped,
+                    CHECKPOINT_DIR,
+                    LOGGER,
+                )
+
             if batch_idx % 10 == 0:
                 LOGGER.info(
                     "Epoch=%d batch=%d | loss=%.4f | lr=%.2e\n",
@@ -271,6 +351,20 @@ def main():
                 log_vram(f"epoch={epoch + 1} batch={batch_idx + 1}", device)
         pbar.close()
         log_vram(f"epoch={epoch + 1} end", device)
+
+        # Also checkpoint at the end of each epoch so epoch boundaries are
+        # always recoverable even if CHECKPOINT_INTERVAL doesn't land there.
+        save_checkpoint(
+            experiment_id,
+            epoch,
+            NUM_BATCHES - 1,
+            model,
+            optimizer,
+            scheduler,
+            skipped,
+            CHECKPOINT_DIR,
+            LOGGER,
+        )
 
     LOGGER.info("saving model to CoLLM.pt")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
