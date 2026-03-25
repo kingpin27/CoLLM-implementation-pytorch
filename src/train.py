@@ -1,5 +1,6 @@
 import os
 import sys
+import uuid
 from datetime import datetime
 
 import torch
@@ -30,6 +31,12 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 
 def main():
+    experiment_id = os.getenv("EXPERIMENT_ID", uuid.uuid4().hex[:8])
+
+    LOGGER.info("=" * 60)
+    LOGGER.info("EXPERIMENT ID: %s", experiment_id)
+    LOGGER.info("=" * 60)
+
     PROCESSOR_NAME = os.getenv("PROCESSOR_NAME", "Qwen/Qwen3.5-0.8B")
     MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3.5-0.8B")
     PROJ_DIM = int(os.getenv("PROJ_DIM", 512))  # same as CLIP-B = P
