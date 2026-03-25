@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 import torch
+import wandb
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -13,7 +14,7 @@ from transformers.optimization import get_linear_schedule_with_warmup
 from dataset import MTCIRDataset
 from logger import LOGGER
 from models import CoLLM
-from utils import collm_contrastive_collate_fn, log_vram, param_summary
+from utils import collm_contrastive_collate_fn, get_git_info, log_vram, param_summary
 
 device = (
     "cuda"
@@ -54,6 +55,36 @@ def main():
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", 64))  # = B
     NUM_WORKERS = int(os.getenv("NUM_WORKERS", 8))
     NUM_BATCHES = int(os.getenv("NUM_BATCHES", (1024 * 128) // BATCH_SIZE))
+
+    run = wandb.init(
+        # Set the wandb entity where your project will be logged (generally your team name).
+        entity="anishchaudhary2706-indian-institute-of-science",
+        # Set the wandb project where this run will be logged.
+        project=f"collm-{experiment_id}",
+        # Track hyperparameters and run metadata.
+        config={
+            # Identifiers
+            "experiment_id": experiment_id,
+            **get_git_info(),
+            # Model
+            "processor_name": PROCESSOR_NAME,
+            "model_name": MODEL_NAME,
+            "keep_layers": KEEP_LAYERS,
+            # Architecture
+            "proj_dim": PROJ_DIM,
+            "num_embs": NUM_EMBS,
+            "hid_dim": HID_DIM,
+            # Training
+            "epochs": EPOCHS,
+            "batch_size": BATCH_SIZE,
+            "num_workers": NUM_WORKERS,
+            "num_batches": NUM_BATCHES,
+            # Loss & Temperature
+            "probe_temp": PROBE_TEMP,
+            "infonce_temp": INFONCE_TEMP,
+            "diversity_weight": DIVERSITY_WEIGHT,
+        },
+    )
 
     LOGGER.info("=" * 60)
     LOGGER.info("HYPERPARAMETERS")
@@ -221,6 +252,14 @@ def main():
 
             pbar.update(1)
 
+            run.log(
+                {
+                    "batch_idx": batch_idx + 1,
+                    "loss": loss.item(),
+                    "lr": scheduler.get_last_lr()[0],
+                }
+            )
+
             if batch_idx % 10 == 0:
                 LOGGER.info(
                     "Epoch=%d batch=%d | loss=%.4f | lr=%.2e\n",
@@ -238,6 +277,8 @@ def main():
     model_filename = f"collm_4probes_{experiment_id}_{timestamp}.pt"
     torch.save(model.state_dict(), model_filename)
     LOGGER.info(f"Model saved as: {model_filename}")
+
+    run.finish()
 
 
 if __name__ == "__main__":

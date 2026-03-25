@@ -1,4 +1,34 @@
+import subprocess
+
 import torch
+
+
+def get_git_info() -> dict:
+    try:
+        commit_hash = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+        short_hash = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+        branch = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+    except subprocess.CalledProcessError:
+        commit_hash = short_hash = branch = "unknown"
+    return {"git_commit": commit_hash, "git_short": short_hash, "git_branch": branch}
 
 
 def collm_contrastive_collate_fn(batch):
