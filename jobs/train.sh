@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=collm
+#SBATCH --job-name=train_collm
 #SBATCH --partition=ada
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16

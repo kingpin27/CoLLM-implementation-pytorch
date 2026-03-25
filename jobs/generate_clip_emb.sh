@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=bash
+#SBATCH --job-name=gen_clip_emb
 #SBATCH --partition=ada
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

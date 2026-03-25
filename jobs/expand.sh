@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=bash
+#SBATCH --job-name=expand_mtcir
 #SBATCH --partition=long
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
