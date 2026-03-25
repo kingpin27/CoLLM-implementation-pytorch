@@ -19,9 +19,10 @@ module load cuda/12.4
 
 # Initialize conda for non-interactive shell
 source /home/anirban/anishc/miniconda3/etc/profile.d/conda.sh
-conda activate collm3
+conda activate collm5
 
-pip install torch torchvision tqdm pillow numpy wandb transformers accelerate --no-cache-dir
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --no-cache-dir
+pip install tqdm pillow numpy wandb transformers accelerate --no-cache-dir
 
 # only after first run
 # echo "Setting up HF offline..."
@@ -52,7 +53,7 @@ export KEEP_LAYERS=16
 export EPOCHS=1
 export BATCH_SIZE=64
 export NUM_WORKERS=4
-export NUM_BATCHES=$(( (1024 * 128) / BATCH_SIZE ))
+export NUM_BATCHES=$(( (1024 * 512) / BATCH_SIZE ))
 
 export PROBE_TEMP=1
 export INFONCE_TEMP=0.1
@@ -67,7 +68,7 @@ cd /home/anirban/anishc/CoLLM-implementation-pytorch
 start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-PYTHON="/home/anirban/anishc/miniconda3/envs/collm3/bin/python"
+PYTHON="/home/anirban/anishc/miniconda3/envs/collm5/bin/python"
 srun "$PYTHON" src/train.py
 
 end_ts=$(date +%s)
