@@ -21,8 +21,8 @@ conda activate collm
 
 
 # only after first run
-# export HF_HUB_OFFLINE=1
-# export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 # Persist Hugging Face caches across Slurm jobs.
 export HF_HOME="/home/anirban/anishc/.cache/huggingface"
