@@ -252,7 +252,7 @@ def main():
     probe_temperature = 1
     # Temperature for InfoNCE contrastive loss.
     # 0.07 (CLIP default) is aggressive early in training; 0.1 is safer to start.
-    infonce_temperature = 0.3
+    infonce_temperature = 0.07
     diversity_weight = 0.1
 
     epochs = 1
