@@ -66,10 +66,12 @@ else
     conda create -y -n "$ENV_NAME" python=3.12
     conda run -n "$ENV_NAME" \
         bash -c '
-            export PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124
-            pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 --index-url https://download.pytorch.org/whl/cu124
-            pip install ninja  # speeds up compilation significantly
-            pip install flash-linear-attention causal-conv1d transformers accelerate diffusers tqdm pillow numpy wandb
+            pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 \
+                --index-url https://download.pytorch.org/whl/cu124
+            pip install ninja packaging setuptools wheel
+            pip install flash-linear-attention --no-build-isolation
+            pip install causal-conv1d --no-build-isolation
+            pip install transformers accelerate diffusers tqdm pillow numpy wandb
         '
     echo "Conda env '${ENV_NAME}' created and packages installed"
 fi
