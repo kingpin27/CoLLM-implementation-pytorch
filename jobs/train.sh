@@ -81,15 +81,26 @@ if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
         bash -c '
             pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 \
             --index-url https://download.pytorch.org/whl/cu124
+
+            echo "--- torch version after initial install ---"
+            pip show torch | grep Version
+
             pip install ninja packaging setuptools wheel
             pip install triton==3.0.0
             pip install flash-linear-attention==0.3.2 --no-build-isolation
             pip install causal-conv1d --no-build-isolation
+
+            echo "--- torch version after fl/causal install ---"
+            pip show torch | grep Version
+
             echo "torch==2.4.0+cu124" > /tmp/constraints.txt
+            echo "torchvision==0.19.0+cu124" >> /tmp/constraints.txt
             pip install transformers accelerate diffusers tqdm pillow numpy wandb \
-            -c /tmp/constraints.txt
+                -c /tmp/constraints.txt -v 2>&1 | grep -i "torch"
+
+            echo "--- torch version after all installs ---"
+            pip show torch | grep Version
         '
-    echo "Conda env '${ENV_NAME}' ready."
 fi
 conda activate "$ENV_NAME"
 # ----------------------
