@@ -27,6 +27,8 @@ source /home/anirban/anishc/miniconda3/etc/profile.d/conda.sh
 
 source ~/.secrets
 
+export WANDB__SERVICE_WAIT=300
+
 # Persist Hugging Face caches across Slurm jobs.
 echo "Setting up HF cache dir..."
 export HF_HOME="/home/anirban/anishc/.cache/huggingface"
