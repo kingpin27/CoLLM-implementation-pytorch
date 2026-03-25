@@ -7,3 +7,4 @@ embeddings
 *.err
 __pycache__
 checkpoints
+.DS_STORE
