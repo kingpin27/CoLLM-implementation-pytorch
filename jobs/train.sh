@@ -59,7 +59,7 @@ else
     conda create -y -n "$ENV_NAME" python=3.12
     conda run -n "$ENV_NAME" pip install \
         torch torchvision \
-        flash-linear-attention \
+        flash-linear-attention causal-conv1d \
         transformers accelerate \
         diffusers \
         tqdm pillow numpy
