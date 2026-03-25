@@ -32,7 +32,9 @@ def _normalize_modifications(raw_modifications: object) -> List[str]:
     return cleaned
 
 
-def max_len(in_path: pathlib.Path, out_path: pathlib.Path, max_len: int = 100) -> None:
+def filter_annotations(
+    in_path: pathlib.Path, out_path: pathlib.Path, max_len: int = 100
+) -> None:
     skipped_examples = 0
     with (
         in_path.open("r", encoding="utf-8") as inp_f,
