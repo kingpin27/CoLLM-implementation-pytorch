@@ -19,6 +19,7 @@ module load cuda/12.4
 
 # Initialize conda for non-interactive shell
 source /home/anirban/anishc/miniconda3/etc/profile.d/conda.sh
+conda activate collm
 
 # only after first run
 # echo "Setting up HF offline..."
@@ -57,21 +58,6 @@ export DIVERSITY_WEIGHT=0.1
 
 # echo "resuming previous experiment..."
 # export EXPERIMENT_ID=adsasd
-
-# --- Conda env setup ---
-echo "Setting up Conda env..."
-ENV_NAME="collm"
-if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
-    echo "Creating conda env '${ENV_NAME}'..."
-    conda create -y -n "$ENV_NAME" python=3.11
-    conda run -n "$ENV_NAME" \
-        bash -c '
-            pip install torch torchvision
-            pip install transformers accelerate diffusers tqdm pillow numpy wandb
-        '
-fi
-conda activate "$ENV_NAME"
-# ----------------------
 
 echo "Setting up CWD..."
 cd /home/anirban/anishc/CoLLM-implementation-pytorch
