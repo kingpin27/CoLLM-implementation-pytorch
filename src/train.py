@@ -109,8 +109,9 @@ def main():
         dataset=train_dataset,
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
-        multiprocessing_context="spawn",
-        pin_memory=False,
+        multiprocessing_context="fork",
+        pin_memory=True,
+        prefetch_factor=2,
         collate_fn=collm_contrastive_collate_fn,
         shuffle=True,
     )
@@ -144,70 +145,71 @@ def main():
             optimizer.zero_grad()
 
             # forwars pass
-            embeddings = model.forward(
-                images=batch["image"],
-                text=batch["modification_text"],
-                processor=processor,
-            )  # (B, K, P)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                embeddings = model.forward(
+                    images=batch["image"],
+                    text=batch["modification_text"],
+                    processor=processor,
+                )  # (B, K, P)
 
-            # Guard: skip batch if backbone produced inf/nan hidden states.
-            # This can happen early in training when fp16 attention overflows.
-            if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
-                skipped += 1
-                LOGGER.warning(
-                    "Epoch=%d batch=%d | bad embeddings (nan/inf), skipping "
-                    "[total skipped=%d]",
-                    epoch + 1,
-                    batch_idx + 1,
-                    skipped,
+                # Guard: skip batch if backbone produced inf/nan hidden states.
+                # This can happen early in training when fp16 attention overflows.
+                if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+                    skipped += 1
+                    LOGGER.warning(
+                        "Epoch=%d batch=%d | bad embeddings (nan/inf), skipping "
+                        "[total skipped=%d]",
+                        epoch + 1,
+                        batch_idx + 1,
+                        skipped,
+                    )
+                    scheduler.step()
+                    pbar.update(1)
+                    continue
+
+                # target embeddings: frozen CLIP vectors, not part of grad graph
+                target_emb = torch.stack(
+                    [torch.from_numpy(e) for e in batch["target_image_emb"]]
+                ).to(device)  # (B, P)
+                target_emb = F.normalize(target_emb, dim=-1)  # (B, P)
+
+                # --- soft probe selection (fully differentiable) ---
+                # Similarity of every probe against its own target: (B, K)
+                per_probe_sim = torch.einsum(
+                    "bkp,bp->bk", embeddings, target_emb
+                )  # (B, K)
+
+                # Soft convex combination weighted by proximity to target.
+                # Gradient flows to ALL K probes; sharpness controlled by probe_temperature.
+                # As probe_temperature -> 0 this approaches hard argmax.
+                probe_weights = torch.softmax(
+                    per_probe_sim / PROBE_TEMP, dim=1
+                )  # (B, K)
+                best_emb = torch.einsum(
+                    "bk,bkp->bp", probe_weights, embeddings
+                )  # (B, P) — still unit-norm after softmax combination (approx)
+                best_emb = F.normalize(best_emb, dim=-1)  # re-normalise to be exact
+
+                # --- symmetric InfoNCE loss ---
+                # Logit matrix: each query's composed embedding vs every target in batch.
+                # Diagonal entries are the positives.
+                logits = torch.matmul(best_emb, target_emb.T) / INFONCE_TEMP  # (B, B)
+                labels = torch.arange(logits.size(0), device=device)  # (B,)
+
+                # Regularise cls_probes directly — they live in a fixed hidden_dim space
+                probe_gram = torch.mm(
+                    F.normalize(model.cls_probes, dim=-1),
+                    F.normalize(model.cls_probes, dim=-1).T,
+                )  # (K, K)
+                off_diag = probe_gram.masked_fill(
+                    torch.eye(NUM_EMBS, device=device, dtype=torch.bool), 0.0
                 )
-                scheduler.step()
-                pbar.update(1)
-                continue
+                diversity_loss = (off_diag**2).sum()
 
-            # target embeddings: frozen CLIP vectors, not part of grad graph
-            target_emb = (
-                torch.stack([torch.from_numpy(e) for e in batch["target_image_emb"]])
-                .to(device)
-                .float()
-            )  # (B, P)
-            target_emb = F.normalize(target_emb, dim=-1)  # (B, P)
-
-            # --- soft probe selection (fully differentiable) ---
-            # Similarity of every probe against its own target: (B, K)
-            per_probe_sim = torch.einsum(
-                "bkp,bp->bk", embeddings.float(), target_emb
-            )  # (B, K)
-
-            # Soft convex combination weighted by proximity to target.
-            # Gradient flows to ALL K probes; sharpness controlled by probe_temperature.
-            # As probe_temperature -> 0 this approaches hard argmax.
-            probe_weights = torch.softmax(per_probe_sim / PROBE_TEMP, dim=1)  # (B, K)
-            best_emb = torch.einsum(
-                "bk,bkp->bp", probe_weights, embeddings.float()
-            )  # (B, P) — still unit-norm after softmax combination (approx)
-            best_emb = F.normalize(best_emb, dim=-1)  # re-normalise to be exact
-
-            # --- symmetric InfoNCE loss ---
-            # Logit matrix: each query's composed embedding vs every target in batch.
-            # Diagonal entries are the positives.
-            logits = torch.matmul(best_emb, target_emb.T) / INFONCE_TEMP  # (B, B)
-            labels = torch.arange(logits.size(0), device=device)  # (B,)
-
-            # Regularise cls_probes directly — they live in a fixed hidden_dim space
-            probe_gram = torch.mm(
-                F.normalize(model.cls_probes.float(), dim=-1),
-                F.normalize(model.cls_probes.float(), dim=-1).T,
-            )  # (K, K)
-            off_diag = probe_gram.masked_fill(
-                torch.eye(NUM_EMBS, device=device, dtype=torch.bool), 0.0
-            )
-            diversity_loss = (off_diag**2).sum()
-
-            loss = (
-                F.cross_entropy(logits, labels)  # query -> target
-                + F.cross_entropy(logits.T, labels)  # target -> query
-            ) / 2 + DIVERSITY_WEIGHT * diversity_loss
+                loss = (
+                    F.cross_entropy(logits, labels)  # query -> target
+                    + F.cross_entropy(logits.T, labels)  # target -> query
+                ) / 2 + DIVERSITY_WEIGHT * diversity_loss
 
             # backward pass
             loss.backward()
@@ -231,7 +233,7 @@ def main():
 
     LOGGER.info("saving model to CoLLM.pt")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_filename = f"collm_4probes_{timestamp}.pt"
+    model_filename = f"collm_4probes_{experiment_id}_{timestamp}.pt"
     torch.save(model.state_dict(), model_filename)
     LOGGER.info(f"Model saved as: {model_filename}")
 
