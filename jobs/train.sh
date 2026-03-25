@@ -69,7 +69,7 @@ else
     conda run -n "$ENV_NAME" \
         bash -c '
             pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 \
-            --index-url https://download.pytorch.org/whl/cu124
+            --index-url https://download.pytorch.org/whl/cu124 --force-reinstall
             pip install ninja packaging setuptools wheel
             pip install triton==3.0.0
             pip install flash-linear-attention==0.3.2 --no-build-isolation
