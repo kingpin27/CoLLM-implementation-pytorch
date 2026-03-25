@@ -2,8 +2,8 @@
 #SBATCH --job-name=train_collm
 #SBATCH --partition=ada
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
 #SBATCH --gres=gpu:1
 #SBATCH --time=48:00:00
 #SBATCH --output=slurm-%j.out
@@ -44,7 +44,7 @@ export KEEP_LAYERS=16
 
 export EPOCHS=1
 export BATCH_SIZE=64
-export NUM_WORKERS=8
+export NUM_WORKERS=4
 export NUM_BATCHES=$(( (1024 * 128) / BATCH_SIZE ))
 
 export PROBE_TEMP=1
