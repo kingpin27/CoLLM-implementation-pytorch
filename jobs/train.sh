@@ -79,15 +79,15 @@ if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
     conda create -y -n "$ENV_NAME" python=3.10
     conda run -n "$ENV_NAME" \
         bash -c '
-            pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 \
+            pip install torch==2.11.0+cu124 torchvision==0.26.0+cu124 \
             --index-url https://download.pytorch.org/whl/cu124
 
             echo "--- torch version after initial install ---"
             pip show torch | grep Version
 
             pip install ninja packaging setuptools wheel
-            pip install triton==3.0.0
-            pip install flash-linear-attention==0.3.2 --no-build-isolation
+            pip install triton
+            pip install flash-linear-attention --no-build-isolation
             pip install causal-conv1d --no-build-isolation
 
             echo "--- torch version after fl/causal install ---"
