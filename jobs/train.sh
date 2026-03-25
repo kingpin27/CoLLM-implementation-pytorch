@@ -19,7 +19,9 @@ module load cuda/12.4
 
 # Initialize conda for non-interactive shell
 source /home/anirban/anishc/miniconda3/etc/profile.d/conda.sh
-conda activate collm
+conda activate collm3
+
+pip install torch torchvision tqdm pillow numpy wandb transformers accelerate
 
 # only after first run
 # echo "Setting up HF offline..."
@@ -65,7 +67,7 @@ cd /home/anirban/anishc/CoLLM-implementation-pytorch
 start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-PYTHON="/home/anirban/anishc/miniconda3/envs/collm/bin/python"
+PYTHON="/home/anirban/anishc/miniconda3/envs/collm3/bin/python"
 srun "$PYTHON" src/train.py
 
 end_ts=$(date +%s)
