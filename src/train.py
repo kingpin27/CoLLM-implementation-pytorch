@@ -348,9 +348,9 @@ def main():
                     loss.item(),
                     scheduler.get_last_lr()[0],
                 )
-                log_vram(f"epoch={epoch + 1} batch={batch_idx + 1}", device)
+                log_vram(f"epoch={epoch + 1} batch={batch_idx + 1}", LOGGER, device)
         pbar.close()
-        log_vram(f"epoch={epoch + 1} end", device)
+        log_vram(f"epoch={epoch + 1} end", LOGGER, device)
 
         # Also checkpoint at the end of each epoch so epoch boundaries are
         # always recoverable even if CHECKPOINT_INTERVAL doesn't land there.

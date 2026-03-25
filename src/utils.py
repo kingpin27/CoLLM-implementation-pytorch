@@ -99,7 +99,7 @@ def collm_contrastive_collate_fn(batch):
     }
 
 
-def log_vram(LOGGER, device, label=""):
+def log_vram(label, LOGGER, device):
     if device != "cuda":
         return
     allocated = torch.cuda.max_memory_allocated() / 1e9
