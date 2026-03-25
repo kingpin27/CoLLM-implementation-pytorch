@@ -65,13 +65,14 @@ if conda env list | grep -qE "^${ENV_NAME}\s"; then
     echo "Conda env '${ENV_NAME}' found, activating..."
 else
     echo "Conda env '${ENV_NAME}' not found, creating..."
-    conda create -y -n "$ENV_NAME" python=3.12
+    conda create -y -n "$ENV_NAME" python=3.10
     conda run -n "$ENV_NAME" \
         bash -c '
             pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 \
-                --index-url https://download.pytorch.org/whl/cu124
+            --index-url https://download.pytorch.org/whl/cu124
             pip install ninja packaging setuptools wheel
-            pip install flash-linear-attention --no-build-isolation
+            pip install triton==2.1.0
+            pip install flash-linear-attention==0.2.4 --no-build-isolation
             pip install causal-conv1d --no-build-isolation
             pip install transformers accelerate diffusers tqdm pillow numpy wandb
         '

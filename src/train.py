@@ -83,7 +83,7 @@ def main():
         # Set the wandb entity where your project will be logged (generally your team name).
         entity="anishchaudhary2706-indian-institute-of-science",
         # Set the wandb project where this run will be logged.
-        project=f"collm-{experiment_id}",
+        project="collm",
         resume="allow" if resume_ckpt_path else None,
         # Track hyperparameters and run metadata.
         config={
