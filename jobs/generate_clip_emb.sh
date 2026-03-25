@@ -31,7 +31,7 @@ cd /home/anirban/anishc/CoLLM-implementation-pytorch
 start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-srun python generate_clip_emb.py
+srun python scripts/generate_clip_emb.py
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))

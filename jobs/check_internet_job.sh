@@ -13,4 +13,4 @@ set -euo pipefail
 
 echo "Node: $(hostname)"
 
-python3 check_internet.py
+python3 scripts/check_internet.py

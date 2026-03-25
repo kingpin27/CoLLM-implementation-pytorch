@@ -1,14 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=four_probe
-#SBATCH --partition=h200
+#SBATCH --job-name=bash
+#SBATCH --partition=ada
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:h200:1
-#SBATCH --time=24:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --time=48:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
-#SBATCH --qos=h200_qos
 
 set -euo pipefail
 
@@ -20,9 +19,10 @@ module load cuda/12.4
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate collm
 
+
 # only after first run
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
+# export HF_HUB_OFFLINE=1
+# export TRANSFORMERS_OFFLINE=1
 
 # Persist Hugging Face caches across Slurm jobs.
 export HF_HOME="/home/anirban/anishc/.cache/huggingface"
@@ -30,13 +30,18 @@ export HF_HUB_CACHE="$HF_HOME/hub"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 export DIFFUSERS_CACHE="$HF_HOME/diffusers"
 mkdir -p "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE" "$DIFFUSERS_CACHE"
-
 cd /home/anirban/anishc/CoLLM-implementation-pytorch
 
 start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-srun python train.py
+srun python scripts/circo_eval.py \
+    --checkpoint ~/CoLLM-implementation-pytorch/collm_0148243.pt \
+    --split val \
+    --annotations ~/CIRCO/annotations/val.json \
+    --coco-img-dir ~/CIRCO/COCO2017_unlabeled/unlabeled2017  \
+    --coco-image-info ~/CIRCO/COCO2017_unlabeled/annotations/image_info_unlabeled2017.json \
+    --output ~/CoLLM-implementation-pytorch/submission_test.json
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))
