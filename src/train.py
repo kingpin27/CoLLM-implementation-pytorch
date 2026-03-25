@@ -89,7 +89,7 @@ def main():
         config={
             # Identifiers
             "experiment_id": experiment_id,
-            **get_git_info(),
+            # **get_git_info(),
             # Model
             "processor_name": PROCESSOR_NAME,
             "model_name": MODEL_NAME,
