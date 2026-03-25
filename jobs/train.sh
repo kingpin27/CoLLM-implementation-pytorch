@@ -61,22 +61,33 @@ export DIVERSITY_WEIGHT=0.1
 # --- Conda env setup ---
 echo "Setting up Conda env..."
 ENV_NAME="collm"
+EXPECTED_TORCH="2.4.0+cu124"
+
+# Check if env exists and has the right torch
 if conda env list | grep -qE "^${ENV_NAME}\s"; then
-    echo "Conda env '${ENV_NAME}' found, activating..."
-else
-    echo "Conda env '${ENV_NAME}' not found, creating..."
+    ACTUAL_TORCH=$(conda run -n "$ENV_NAME" python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "none")
+    if [[ "$ACTUAL_TORCH" != "$EXPECTED_TORCH" ]]; then
+        echo "Torch mismatch (got $ACTUAL_TORCH, want $EXPECTED_TORCH). Nuking env..."
+        conda env remove -y -n "$ENV_NAME"
+    else
+        echo "Conda env '${ENV_NAME}' OK (torch=$ACTUAL_TORCH)"
+    fi
+fi
+
+if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
+    echo "Creating conda env '${ENV_NAME}'..."
     conda create -y -n "$ENV_NAME" python=3.10
     conda run -n "$ENV_NAME" \
         bash -c '
             pip install torch==2.4.0+cu124 torchvision==0.19.0+cu124 \
-            --index-url https://download.pytorch.org/whl/cu124 --force-reinstall
+            --index-url https://download.pytorch.org/whl/cu124
             pip install ninja packaging setuptools wheel
             pip install triton==3.0.0
             pip install flash-linear-attention==0.3.2 --no-build-isolation
             pip install causal-conv1d --no-build-isolation
             pip install transformers accelerate diffusers tqdm pillow numpy wandb
         '
-    echo "Conda env '${ENV_NAME}' created and packages installed"
+    echo "Conda env '${ENV_NAME}' ready."
 fi
 conda activate "$ENV_NAME"
 # ----------------------
