@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -16,7 +16,9 @@ nvidia-smi
 
 module purge
 module load cuda/12.4
-module load conda/3.12
+
+# Initialize conda for non-interactive shell
+source /home/anirban/anishc/miniconda3/etc/profile.d/conda.sh
 
 # only after first run
 # echo "Setting up HF offline..."
