@@ -23,7 +23,7 @@ module load conda/3.12
 # export HF_HUB_OFFLINE=1
 # export TRANSFORMERS_OFFLINE=1
 
-export WANDB_API_KEY=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
+source .secrets
 
 # Persist Hugging Face caches across Slurm jobs.
 echo "Setting up HF cache dir..."
