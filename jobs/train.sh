@@ -100,7 +100,8 @@ cd /home/anirban/anishc/CoLLM-implementation-pytorch
 start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-srun python src/train.py
+PYTHON="/home/anirban/anishc/miniconda3/envs/collm/bin/python"
+srun "$PYTHON" src/train.py
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))
