@@ -218,7 +218,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="submission.json")
     # must match your training config exactly:
     parser.add_argument("--model-name", default="Qwen/Qwen3.5-0.8B")
-    parser.add_argument("--projection-dim", type=int, default=768)
+    parser.add_argument("--projection-dim", type=int, default=512)
     parser.add_argument("--num-embeddings", type=int, default=4)
     parser.add_argument("--hidden-dim", type=int, default=1024)
     args = parser.parse_args()
