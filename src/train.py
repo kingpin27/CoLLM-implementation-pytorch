@@ -143,7 +143,6 @@ def main():
     param_summary(model, LOGGER)
     LOGGER.info("Model loaded and ready")
 
-    model.model.model.language_model.gradient_checkpointing_enable()
     model.model.model.language_model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
@@ -186,6 +185,7 @@ def main():
     # Restore checkpoint state (model weights, optimizer, scheduler, etc.)
     # Must happen *after* model + optimizer + scheduler are constructed.
     # ------------------------------------------------------------------
+    skipped = 0
     if resume_ckpt_path:
         LOGGER.info("Resuming from checkpoint: %s", resume_ckpt_path)
         ckpt = torch.load(resume_ckpt_path, map_location=device)
@@ -208,7 +208,6 @@ def main():
     LOGGER.info("Starting training for %d epoch(s)", EPOCHS)
     LOGGER.info("Training on total exmaples: %d", NUM_BATCHES * BATCH_SIZE)
 
-    skipped = 0
     for epoch in range(EPOCHS):
         LOGGER.info("Running epoch %d/%d", epoch + 1, EPOCHS)
         # On the resumed epoch we fast-forward the dataloader by skipping
@@ -233,7 +232,7 @@ def main():
                 next(loader_iter)
             except StopIteration:
                 break
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(loader_iter):
             if batch is None:
                 continue
             if batch_idx >= NUM_BATCHES:
@@ -308,6 +307,9 @@ def main():
                     F.cross_entropy(logits, labels)  # query -> target
                     + F.cross_entropy(logits.T, labels)  # target -> query
                 ) / 2 + DIVERSITY_WEIGHT * diversity_loss
+
+                del target_emb, best_emb, logits, embeddings
+                torch.cuda.empty_cache()  # only after del, not instead of it
 
             # backward pass
             loss.backward()
