@@ -208,7 +208,7 @@ def main(args):
         texts = [q["modification_text"] for q in batch]
 
         best_sims = encode_queries_batch(
-            model, processor, images, texts, gallery_embs
+            model, processor, images, texts, gallery_embs, args.probe_temp
         )  # (B, N)
 
         for i, q in enumerate(batch):
@@ -245,6 +245,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-name", default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--projection-dim", type=int, default=512)
     parser.add_argument("--num-embeddings", type=int, default=4)
+    parser.add_argument("--probe-temp", type=float, default=1.0)
     parser.add_argument("--hidden-dim", type=int, default=1024)
     args = parser.parse_args()
     main(args)

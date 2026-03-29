@@ -43,7 +43,8 @@ srun python src/circo_eval.py \
     --annotations ~/CIRCO/annotations/val.json \
     --coco-img-dir ~/CIRCO/COCO2017_unlabeled/unlabeled2017  \
     --coco-image-info ~/CIRCO/COCO2017_unlabeled/annotations/image_info_unlabeled2017.json \
-    --output ~/CoLLM-implementation-pytorch/submission_test_a75271cf.json
+    --output ~/CoLLM-implementation-pytorch/submission_test_a75271cf.json \
+    --probe-temp 1.0
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))
