@@ -100,12 +100,26 @@ def load_queries(annotations_path: str, coco_img_dir: str):
 
 # ── 3. Encode a single query with CoLLM ───────────────────────────────────────
 @torch.no_grad()
-def encode_queries_batch(model, processor, images, texts, gallery_embs):
+def encode_queries_batch(
+    model, processor, images, texts, gallery_embs, probe_temp: float = 1.0
+):
     """
-    Instead of collapsing K embeddings into one, compute similarity
-    against the gallery for all K probes and take the max.
+    Mirrors the soft probe selection used during training:
+      1. Compute per-probe similarity against every gallery image.
+      2. Use those similarities as weights (softmax over K) to form a
+         convex combination of the K probe embeddings.
+      3. Re-normalise to unit norm and score against the full gallery.
 
-    Returns: (B,) best similarity score per query — already resolved to top-50.
+    At eval time we don't have a ground-truth target to derive probe_weights
+    from (as in train.py's per_probe_sim = einsum("bkp,bp->bk", ...)), so
+    we use each probe's mean similarity over the full gallery as a proxy for
+    its relevance — a soft consensus score.
+
+    Args:
+        probe_temp: temperature for soft probe selection (should match
+                    training PROBE_TEMP; lower = closer to hard argmax).
+
+    Returns: (B, N) similarity matrix — use .topk(50) per row.
     """
     embeddings = model.forward(
         images=images,
@@ -115,16 +129,27 @@ def encode_queries_batch(model, processor, images, texts, gallery_embs):
 
     B, K, P = embeddings.shape
 
-    # Flatten to (B*K, P) → compute all sims at once
-    flat_embs = embeddings.float().reshape(B * K, P)  # (B*K, P)
-    flat_embs = F.normalize(flat_embs, dim=-1)
+    # Normalise all probe embeddings once
+    embeddings = F.normalize(embeddings.float(), dim=-1)  # (B, K, P)
 
-    # sims: (B*K, N)
-    sims = flat_embs @ gallery_embs.T  # (B*K, N)
+    # ── Soft probe selection ──────────────────────────────────────────────
+    # Per-probe similarity against every gallery image: (B, K, N)
+    # gallery_embs is already unit-normalised → dot product = cosine sim
+    probe_gallery_sims = torch.einsum(
+        "bkp,np->bkn", embeddings, gallery_embs
+    )  # (B, K, N)
 
-    # Reshape to (B, K, N), take max over K
-    sims = sims.reshape(B, K, -1)  # (B, K, N)
-    best_sims, _ = sims.max(dim=1)  # (B, N)
+    # Summarise each probe's "relevance" as its mean sim over the gallery,
+    # then softmax over K to get the convex-combination weights.
+    per_probe_score = probe_gallery_sims.mean(dim=-1)  # (B, K)
+    probe_weights = torch.softmax(per_probe_score / probe_temp, dim=1)  # (B, K)
+
+    # Weighted combination of probe embeddings → single query vector per item
+    best_emb = torch.einsum("bk,bkp->bp", probe_weights, embeddings)  # (B, P)
+    best_emb = F.normalize(best_emb, dim=-1)  # re-normalise (mirrors train.py)
+
+    # Final gallery similarities
+    best_sims = best_emb @ gallery_embs.T  # (B, N)
 
     return best_sims  # (B, N) — use .topk(50) per row
 

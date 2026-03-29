@@ -17,13 +17,12 @@ from models import CoLLM
 from utils import (
     collm_contrastive_collate_fn,
     find_latest_checkpoint,
-    get_git_info,
     log_vram,
     param_summary,
     save_checkpoint,
 )
 
-CHECKPOINT_INTERVAL = 100000  # save a checkpoint every N batches
+CHECKPOINT_INTERVAL = 1000  # save a checkpoint every N batches
 CHECKPOINT_DIR = "./checkpoints"
 
 device = (
@@ -89,7 +88,6 @@ def main():
         config={
             # Identifiers
             "experiment_id": experiment_id,
-            # **get_git_info(),
             # Model
             "processor_name": PROCESSOR_NAME,
             "model_name": MODEL_NAME,
@@ -296,6 +294,7 @@ def main():
                 labels = torch.arange(logits.size(0), device=device)  # (B,)
 
                 # Regularise cls_probes directly — they live in a fixed hidden_dim space
+                # calulates sum of square of cosine similarity between probes
                 probe_gram = torch.mm(
                     F.normalize(model.cls_probes, dim=-1),
                     F.normalize(model.cls_probes, dim=-1).T,
