@@ -83,6 +83,8 @@ class CoLLM(torch.nn.Module):
             images=list(image),
             return_tensors="pt",
             padding=True,
+            truncation=True,
+            max_length=512,
         )
         return {k: v.to(self.device) for k, v in enc.items()}
 
