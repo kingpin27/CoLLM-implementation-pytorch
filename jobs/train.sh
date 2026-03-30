@@ -51,7 +51,7 @@ export HID_DIM=1024
 export KEEP_LAYERS=16
 
 export EPOCHS=1
-export BATCH_SIZE=64
+export BATCH_SIZE=32
 export NUM_WORKERS=4
 export NUM_BATCHES=$(( (1024 * 512) / BATCH_SIZE ))
 
