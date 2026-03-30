@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=circo_eval
-#SBATCH --partition=ada
+#SBATCH --partition=long
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -38,14 +38,14 @@ start_ts=$(date +%s)
 echo "CIRCO eval started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
 srun python src/circo_eval.py \
-    --checkpoint ~/CoLLM-implementation-pytorch/collm_4probes_a75271cf_20260326_213951.pt \
-    --split val \
-    --annotations ~/CIRCO/annotations/val.json \
+    --checkpoint ~/CoLLM-implementation-pytorch/collm_4probes_645f4850_20260329_093448.pt \
+    --split test \
+    --annotations ~/CIRCO/annotations/test.json \
     --coco-img-dir ~/CIRCO/COCO2017_unlabeled/unlabeled2017  \
     --coco-image-info ~/CIRCO/COCO2017_unlabeled/annotations/image_info_unlabeled2017.json \
-    --output ~/CoLLM-implementation-pytorch/submission_test_a75271cf.json \
-    --probe-temp 1.0
-
+    --output ~/CoLLM-implementation-pytorch/submission_test_645f4850.json \
+    --probe-temp 1.0 \
+    --num-embeddings 4
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))
 echo "CIRCO eval finished at: $(date '+%Y-%m-%d %H:%M:%S')"

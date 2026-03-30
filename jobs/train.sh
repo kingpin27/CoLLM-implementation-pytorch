@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=train_collm
-#SBATCH --partition=ada
+#SBATCH --partition=a100
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=2:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -46,18 +46,18 @@ echo "Setting up Training hyperparameters env..."
 export PROCESSOR_NAME="Qwen/Qwen3.5-0.8B"
 export MODEL_NAME="Qwen/Qwen3.5-0.8B"
 export PROJ_DIM=512
-export NUM_EMBS=4
+export NUM_EMBS=2
 export HID_DIM=1024
 export KEEP_LAYERS=16
 
 export EPOCHS=1
 export BATCH_SIZE=64
 export NUM_WORKERS=4
-export NUM_BATCHES=$(( (1024 * 512) / BATCH_SIZE ))
+export NUM_BATCHES=$(( (1024 * 1024) / BATCH_SIZE ))
 
-export PROBE_TEMP=1
-export INFONCE_TEMP=0.1
-export DIVERSITY_WEIGHT=0.1
+export PROBE_TEMP=0.5
+export INFONCE_TEMP=0.07
+export DIVERSITY_WEIGHT=0.05
 
 # echo "resuming previous experiment..."
 # export EXPERIMENT_ID=adsasd
