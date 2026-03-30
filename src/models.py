@@ -90,9 +90,9 @@ class CoLLM(torch.nn.Module):
         inputs = self.make_inputs(processor, images, text)
         with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
             outputs = self.model.model(
-                **inputs, output_hidden_states=True, return_dict=True
+                **inputs, output_hidden_states=False, return_dict=True
             )
-        hidden = outputs.hidden_states[-1]  # cast OUT of fp16 immediately
+        hidden = outputs.last_hidden_state
         mask = inputs["attention_mask"].to(torch.bfloat16)  # (B, S)
 
         scores = torch.matmul(

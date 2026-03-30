@@ -319,11 +319,10 @@ def main():
                     + F.cross_entropy(logits.T, labels)  # target -> query
                 ) / 2 + DIVERSITY_WEIGHT * (diversity_loss + output_diversity_loss)
 
-                del target_emb, best_emb, logits, embeddings
-                torch.cuda.empty_cache()  # only after del, not instead of it
-
-            # backward pass
+            # backward pass — del after backward so the autograd graph is released
             loss.backward()
+            loss_val = loss.item()
+            del target_emb, best_emb, logits, embeddings, loss
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
@@ -333,7 +332,7 @@ def main():
             run.log(
                 {
                     "batch_idx": batch_idx + 1,
-                    "loss": loss.item(),
+                    "loss": loss_val,
                     "lr": scheduler.get_last_lr()[0],
                     "probe_temp": current_probe_temp,
                 }
@@ -361,7 +360,7 @@ def main():
                     "Epoch=%d batch=%d | loss=%.4f | lr=%.2e\n",
                     epoch + 1,
                     batch_idx + 1,
-                    loss.item(),
+                    loss_val,
                     scheduler.get_last_lr()[0],
                 )
                 log_vram(f"epoch={epoch + 1} batch={batch_idx + 1}", LOGGER, device)
