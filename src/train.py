@@ -41,6 +41,35 @@ LOGGER.info(f"accelerator type: {device}")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 
+class EmbeddingQueue:
+    def __init__(self, size, dim, device):
+        self.queue = torch.randn(size, dim, device=device)
+        self.queue = F.normalize(self.queue, dim=-1)
+        self.ptr = 0
+        self.size = size
+        self.full = False
+
+    @torch.no_grad()
+    def enqueue(self, embeddings):
+        # embeddings: (B, P)
+        B = embeddings.size(0)
+        end = (self.ptr + B) % self.size
+        if end > self.ptr:
+            self.queue[self.ptr : end] = embeddings.detach()
+        else:  # wrap-around
+            self.queue[self.ptr :] = embeddings.detach()[: self.size - self.ptr]
+            self.queue[:end] = embeddings.detach()[self.size - self.ptr :]
+        self.ptr = end
+        if self.ptr == 0:
+            self.full = True
+
+    def get(self):
+        # returns only the filled portion early in training
+        if self.full:
+            return self.queue.clone()
+        return self.queue[: self.ptr].clone()
+
+
 def main():
     experiment_id = os.getenv("EXPERIMENT_ID", uuid.uuid4().hex[:8])
 
@@ -65,6 +94,7 @@ def main():
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", 64))  # = B
     NUM_WORKERS = int(os.getenv("NUM_WORKERS", 8))
     NUM_BATCHES = int(os.getenv("NUM_BATCHES", (1024 * 128) // BATCH_SIZE))
+    K_HARD = int(os.getenv("K_HARD", 64))
 
     # ------------------------------------------------------------------
     # Checkpoint resume: look for an existing checkpoint only when
@@ -106,6 +136,7 @@ def main():
             "probe_temp": PROBE_TEMP,
             "infonce_temp": INFONCE_TEMP,
             "diversity_weight": DIVERSITY_WEIGHT,
+            "k_hard": K_HARD,
         },
     )
 
@@ -121,6 +152,7 @@ def main():
     LOGGER.info("  %-20s %s", "PROBE_TEMP:", PROBE_TEMP)
     LOGGER.info("  %-20s %s", "INFONCE_TEMP:", INFONCE_TEMP)
     LOGGER.info("  %-20s %s", "DIVERSITY_WEIGHT:", DIVERSITY_WEIGHT)
+    LOGGER.info("  %-20s %s", "K_HARD:", K_HARD)
     LOGGER.info("  %-20s %s", "EPOCHS:", EPOCHS)
     LOGGER.info("  %-20s %s", "BATCH_SIZE:", BATCH_SIZE)
     LOGGER.info("  %-20s %s", "NUM_WORKERS:", NUM_WORKERS)
@@ -169,7 +201,7 @@ def main():
         pin_memory=True,
         prefetch_factor=2,
         collate_fn=collm_contrastive_collate_fn,
-        shuffle=True,
+        shuffle=False,
     )
 
     LOGGER.info("Initializing optimizer (AdamW, lr=1e-4)")
@@ -226,6 +258,8 @@ def main():
             leave=False,
         )
         loader_iter = iter(train_loader)
+
+        queue = EmbeddingQueue(size=4096, dim=PROJ_DIM, device=device)
 
         # Consume (but don't train on) the already-processed batches.
         for _ in range(start_batch):
@@ -288,11 +322,64 @@ def main():
                 )  # (B, P) — still unit-norm after softmax combination (approx)
                 best_emb = F.normalize(best_emb, dim=-1)  # re-normalise to be exact
 
-                # --- symmetric InfoNCE loss ---
-                # Logit matrix: each query's composed embedding vs every target in batch.
-                # Diagonal entries are the positives.
-                logits = torch.matmul(best_emb, target_emb.T) / INFONCE_TEMP  # (B, B)
-                labels = torch.arange(logits.size(0), device=device)  # (B,)
+                # ----------------------------------------------------------------
+                # Enqueue *before* computing loss so current batch can also act
+                # as negatives for itself via the in-batch term below.
+                # Must happen before `del target_emb`.
+                # ----------------------------------------------------------------
+                queue.enqueue(target_emb)  # stop-gradient, detach inside
+
+                # ----------------------------------------------------------------
+                # Hard negative mining from queue
+                # ----------------------------------------------------------------
+                queue_negs = queue.get()  # (Q, P)  — detached, no grad
+                use_hard_negs = queue_negs.size(0) >= K_HARD
+
+                hard_neg_sim = None
+                hard_neg_indices = None
+                neg_sim = None
+
+                if use_hard_negs:
+                    # Similarity of each query to every queued target.
+                    neg_sim = torch.matmul(best_emb, queue_negs.T)  # (B, Q)
+
+                    # Top-K most similar (hardest) queue entries per query.
+                    hard_neg_indices = neg_sim.topk(
+                        K_HARD, dim=1
+                    ).indices  # (B, K_HARD)
+                    # hard_negs = queue_negs[hard_neg_indices]  # (B, K_HARD, P)
+
+                    # (B, K_HARD) similarity scores — no extra matmul needed.
+                    hard_neg_sim = neg_sim.gather(1, hard_neg_indices)  # (B, K_HARD)
+
+                # ----------------------------------------------------------------
+                # Build augmented logit matrix
+                #
+                # Row layout per query:  [positive | in-batch negatives | hard-queue negatives]
+                #   col 0          : dot(query_i, target_i)           ← the positive
+                #   cols 1..B      : dot(query_i, target_j), j≠i      ← in-batch negatives
+                #   cols B+1..B+K_HARD : hard queue negatives          ← only if queue ready
+                # ----------------------------------------------------------------
+                # Positive similarity: (B, 1)
+                pos_sim = (best_emb * target_emb).sum(dim=-1, keepdim=True)
+
+                # In-batch negatives: mask out the diagonal (those are positives).
+                inbatch_sim = torch.matmul(best_emb, target_emb.T)  # (B, B)
+                diag_mask = torch.eye(
+                    inbatch_sim.size(0), dtype=torch.bool, device=device
+                )
+                inbatch_neg_sim = inbatch_sim.masked_fill(diag_mask, -1e4)  # (B, B)
+
+                cats = [pos_sim, inbatch_neg_sim]
+                if use_hard_negs and hard_neg_sim is not None:
+                    cats.append(hard_neg_sim)
+                full_logits = torch.cat(cats, dim=1) / INFONCE_TEMP  # (B, 1+B[+K_HARD])
+
+                # Label 0 = the positive is always the first column.
+                hard_labels = torch.zeros(
+                    full_logits.size(0), dtype=torch.long, device=device
+                )
+                loss_contrastive = F.cross_entropy(full_logits, hard_labels)
 
                 # Regularise cls_probes directly — they live in a fixed hidden_dim space
                 # calulates sum of square of cosine similarity between probes
@@ -314,13 +401,15 @@ def main():
                 )
                 output_diversity_loss = (output_off_diag**2).sum()
 
-                loss = (
-                    F.cross_entropy(logits, labels)  # query -> target
-                    + F.cross_entropy(logits.T, labels)  # target -> query
-                ) / 2 + DIVERSITY_WEIGHT * (diversity_loss + output_diversity_loss)
+                loss = loss_contrastive + DIVERSITY_WEIGHT * (
+                    diversity_loss + output_diversity_loss
+                )
 
-                del target_emb, best_emb, logits, embeddings
-                torch.cuda.empty_cache()  # only after del, not instead of it
+                del target_emb, best_emb, embeddings, full_logits
+                del inbatch_sim, inbatch_neg_sim, pos_sim
+                if use_hard_negs:
+                    del hard_neg_sim, hard_neg_indices, neg_sim
+                torch.cuda.empty_cache()
 
             # backward pass
             loss.backward()
