@@ -84,7 +84,7 @@ class CoLLM(torch.nn.Module):
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=1024,
         )
         return {k: v.to(self.device) for k, v in enc.items()}
 
