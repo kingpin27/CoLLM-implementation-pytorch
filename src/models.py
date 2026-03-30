@@ -43,6 +43,8 @@ class CoLLM(torch.nn.Module):
             dtype=self.model_dtype,
         )
 
+        self.probe_router = torch.nn.Linear(projection_dim, num_embeddings)
+
     def make_inputs(self, processor, image, text):
         if not isinstance(image, (list, tuple)):
             image = [image]

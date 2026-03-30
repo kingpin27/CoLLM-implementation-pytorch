@@ -77,9 +77,6 @@ def build_gallery(coco_img_dir: str, image_info_path: str, batch_size: int = 64)
 
 # ── 2. Load CIRCO queries ──────────────────────────────────────────────────────
 def load_queries(annotations_path: str, coco_img_dir: str):
-    """
-    Returns list of dicts with keys: query_id, image_path, modification_text
-    """
     with open(annotations_path) as f:
         annotations = json.load(f)
 
@@ -91,35 +88,42 @@ def load_queries(annotations_path: str, coco_img_dir: str):
                 "image_path": os.path.join(
                     coco_img_dir, f"{ann['reference_img_id']:012d}.jpg"
                 ),
-                # CIRCO annotation field for the relative caption:
                 "modification_text": ann["relative_caption"],
             }
         )
     return queries
 
 
-# ── 3. Encode a single query with CoLLM ───────────────────────────────────────
+# ── 3. Encode queries with CoLLM ──────────────────────────────────────────────
 @torch.no_grad()
 def encode_queries_batch(
-    model, processor, images, texts, gallery_embs, probe_temp: float = 1.0
+    model,
+    processor,
+    images,
+    texts,
+    gallery_embs,
+    probe_temp: float,
+    aggregation: str,
 ):
     """
-    Mirrors the soft probe selection used during training:
-      1. Compute per-probe similarity against every gallery image.
-      2. Use those similarities as weights (softmax over K) to form a
-         convex combination of the K probe embeddings.
-      3. Re-normalise to unit norm and score against the full gallery.
+    Produces per-query similarity scores against the full gallery.
 
-    At eval time we don't have a ground-truth target to derive probe_weights
-    from (as in train.py's per_probe_sim = einsum("bkp,bp->bk", ...)), so
-    we use each probe's mean similarity over the full gallery as a proxy for
-    its relevance — a soft consensus score.
+    aggregation choices
+    -------------------
+    "learned_router"  — uses model.probe_router (query-conditioned MLP).
+                        Only available if you retrained with Fix 1 / Option B.
+                        Identical to training behaviour. USE THIS if available.
 
-    Args:
-        probe_temp: temperature for soft probe selection (should match
-                    training PROBE_TEMP; lower = closer to hard argmax).
+    "max_pool"        — takes the max across K probes per gallery image.
+                        Strong baseline; no routing needed; consistent at
+                        train and test time.
 
-    Returns: (B, N) similarity matrix — use .topk(50) per row.
+    "mean_pool"       — averages K probes then re-normalises.
+                        Weaker than max but still train/test consistent.
+
+    DO NOT use "gallery_mean" (the old approach) — it uses mean gallery
+    similarity as a proxy for probe relevance, which has no correspondence
+    to any training signal and is the root cause of train/test mismatch.
     """
     embeddings = model.forward(
         images=images,
@@ -128,37 +132,45 @@ def encode_queries_batch(
     )  # (B, K, P)
 
     B, K, P = embeddings.shape
-
-    # Normalise all probe embeddings once
     embeddings = F.normalize(embeddings.float(), dim=-1)  # (B, K, P)
 
-    # ── Soft probe selection ──────────────────────────────────────────────
-    # Per-probe similarity against every gallery image: (B, K, N)
-    # gallery_embs is already unit-normalised → dot product = cosine sim
-    probe_gallery_sims = torch.einsum(
-        "bkp,np->bkn", embeddings, gallery_embs
-    )  # (B, K, N)
+    if aggregation == "learned_router":
+        # ── Query-conditioned routing (matches training if you applied Fix 1) ──
+        # model.probe_router: nn.Linear(PROJ_DIM, NUM_EMBS) or small MLP
+        # Input: mean of probe embeddings as a query-side summary — (B, P)
+        query_summary = embeddings.mean(dim=1)  # (B, P)
+        probe_logits = model.probe_router(query_summary)  # (B, K)
+        probe_weights = torch.softmax(probe_logits / probe_temp, dim=1)  # (B, K)
+        best_emb = torch.einsum("bk,bkp->bp", probe_weights, embeddings)  # (B, P)
+        best_emb = F.normalize(best_emb, dim=-1)
+        sims = best_emb @ gallery_embs.T  # (B, N)
 
-    # Summarise each probe's "relevance" as its mean sim over the gallery,
-    # then softmax over K to get the convex-combination weights.
-    per_probe_score = probe_gallery_sims.mean(dim=-1)  # (B, K)
-    probe_weights = torch.softmax(per_probe_score / probe_temp, dim=1)  # (B, K)
+    elif aggregation == "max_pool":
+        # ── Max-pool across probes — no routing, fully consistent ──────────────
+        # For each query and each gallery image, take the highest-scoring probe.
+        # Shape: (B, K, N) → max over K → (B, N)
+        probe_sims = torch.einsum("bkp,np->bkn", embeddings, gallery_embs)  # (B, K, N)
+        sims, _ = probe_sims.max(dim=1)  # (B, N)
 
-    # Weighted combination of probe embeddings → single query vector per item
-    best_emb = torch.einsum("bk,bkp->bp", probe_weights, embeddings)  # (B, P)
-    best_emb = F.normalize(best_emb, dim=-1)  # re-normalise (mirrors train.py)
+    elif aggregation == "mean_pool":
+        # ── Mean-pool across probes ─────────────────────────────────────────────
+        mean_emb = embeddings.mean(dim=1)  # (B, P)
+        mean_emb = F.normalize(mean_emb, dim=-1)
+        sims = mean_emb @ gallery_embs.T  # (B, N)
 
-    # Final gallery similarities
-    best_sims = best_emb @ gallery_embs.T  # (B, N)
+    else:
+        raise ValueError(
+            f"Unknown aggregation '{aggregation}'. "
+            "Choose: learned_router | max_pool | mean_pool"
+        )
 
-    return best_sims  # (B, N) — use .topk(50) per row
+    return sims  # (B, N)
 
 
 # ── 4. Main ────────────────────────────────────────────────────────────────────
 def main(args):
 
-    # --- Build gallery ---
-    # CIRCO gallery = COCO 2017 unlabeled images
+    # --- Build / load gallery ---
     print("Building gallery index (this takes a while the first time)...")
     gallery_cache = (
         "/home/anirban/anishc/CoLLM-implementation-pytorch/clip_unlabeled2017_cache.pt"
@@ -194,7 +206,16 @@ def main(args):
     model.to(device).eval()
 
     processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
-    print("Model ready")
+    print(
+        f"Model ready  |  aggregation={args.aggregation}  |  probe_temp={args.probe_temp}"
+    )
+
+    # Validate learned_router is actually available before iterating
+    if args.aggregation == "learned_router" and not hasattr(model, "probe_router"):
+        raise AttributeError(
+            "--aggregation learned_router requires model.probe_router to exist. "
+            "Either retrain with Fix 1 or use --aggregation max_pool instead."
+        )
 
     batch_size = 4
 
@@ -208,7 +229,13 @@ def main(args):
         texts = [q["modification_text"] for q in batch]
 
         best_sims = encode_queries_batch(
-            model, processor, images, texts, gallery_embs, args.probe_temp
+            model=model,
+            processor=processor,
+            images=images,
+            texts=texts,
+            gallery_embs=gallery_embs,
+            probe_temp=args.probe_temp,
+            aggregation=args.aggregation,
         )  # (B, N)
 
         for i, q in enumerate(batch):
@@ -241,11 +268,21 @@ if __name__ == "__main__":
         help="COCO2017_unlabeled/annotations/image_info_unlabeled2017.json",
     )
     parser.add_argument("--output", default="submission.json")
-    # must match your training config exactly:
+    # Must match your training config exactly:
     parser.add_argument("--model-name", default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--projection-dim", type=int, default=512)
     parser.add_argument("--num-embeddings", type=int, default=4)
-    parser.add_argument("--probe-temp", type=float, default=1.0)
     parser.add_argument("--hidden-dim", type=int, default=1024)
+    parser.add_argument("--probe-temp", type=float, default=1.0)
+    parser.add_argument(
+        "--aggregation",
+        default="max_pool",
+        choices=["learned_router", "max_pool", "mean_pool"],
+        help=(
+            "How to combine K probe embeddings at inference. "
+            "'learned_router' requires retraining with Fix 1. "
+            "'max_pool' is the best drop-in for existing checkpoints."
+        ),
+    )
     args = parser.parse_args()
     main(args)

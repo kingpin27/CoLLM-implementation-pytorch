@@ -5,6 +5,12 @@ import subprocess
 import torch
 
 
+# Before your training loop
+def get_probe_temp(batch_idx, total_batches, temp_start=1.0, temp_end=0.1):
+    progress = min(batch_idx / total_batches, 1.0)
+    return temp_start * (temp_end / temp_start) ** progress  # exponential decay
+
+
 def save_checkpoint(
     experiment_id,
     epoch,

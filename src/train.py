@@ -17,6 +17,7 @@ from models import CoLLM
 from utils import (
     collm_contrastive_collate_fn,
     find_latest_checkpoint,
+    get_probe_temp,
     log_vram,
     param_summary,
     save_checkpoint,
@@ -270,17 +271,18 @@ def main():
                 target_emb = F.normalize(target_emb, dim=-1)  # (B, P)
 
                 # --- soft probe selection (fully differentiable) ---
-                # Similarity of every probe against its own target: (B, K)
-                per_probe_sim = torch.einsum(
-                    "bkp,bp->bk", embeddings, target_emb
+                # input-conditioned routing (query-side only, no target)
+                current_probe_temp = get_probe_temp(
+                    batch_idx + start_batch,
+                    NUM_BATCHES * EPOCHS,
+                    temp_start=PROBE_TEMP,
+                    temp_end=0.1,
+                )
+                probe_logits = model.probe_router(embeddings.mean(dim=1))  # (B, K)
+                probe_weights = torch.softmax(
+                    probe_logits / current_probe_temp, dim=1
                 )  # (B, K)
 
-                # Soft convex combination weighted by proximity to target.
-                # Gradient flows to ALL K probes; sharpness controlled by probe_temperature.
-                # As probe_temperature -> 0 this approaches hard argmax.
-                probe_weights = torch.softmax(
-                    per_probe_sim / PROBE_TEMP, dim=1
-                )  # (B, K)
                 best_emb = torch.einsum(
                     "bk,bkp->bp", probe_weights, embeddings
                 )  # (B, P) — still unit-norm after softmax combination (approx)
@@ -303,10 +305,19 @@ def main():
                 )
                 diversity_loss = (off_diag**2).sum()
 
+                # diversity in output embedding space across the batch
+                # embeddings: (B, K, P)
+                mean_probes = F.normalize(embeddings.mean(dim=0), dim=-1)  # (K, P)
+                output_gram = torch.mm(mean_probes, mean_probes.T)  # (K, K)
+                output_off_diag = output_gram.masked_fill(
+                    torch.eye(NUM_EMBS, device=device, dtype=torch.bool), 0.0
+                )
+                output_diversity_loss = (output_off_diag**2).sum()
+
                 loss = (
                     F.cross_entropy(logits, labels)  # query -> target
                     + F.cross_entropy(logits.T, labels)  # target -> query
-                ) / 2 + DIVERSITY_WEIGHT * diversity_loss
+                ) / 2 + DIVERSITY_WEIGHT * (diversity_loss + output_diversity_loss)
 
                 del target_emb, best_emb, logits, embeddings
                 torch.cuda.empty_cache()  # only after del, not instead of it
@@ -324,6 +335,7 @@ def main():
                     "batch_idx": batch_idx + 1,
                     "loss": loss.item(),
                     "lr": scheduler.get_last_lr()[0],
+                    "probe_temp": current_probe_temp,
                 }
             )
 
