@@ -2,9 +2,9 @@
 #SBATCH --job-name=train_collm
 #SBATCH --partition=ada
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:2
 #SBATCH --time=24:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
@@ -69,7 +69,8 @@ start_ts=$(date +%s)
 echo "Traininig started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
 PYTHON="/home/anirban/anishc/miniconda3/envs/collm5/bin/python"
-srun "$PYTHON" src/train.py
+ACCELERATE="/home/anirban/anishc/miniconda3/envs/collm5/bin/accelerate"
+srun "$ACCELERATE" launch --num_processes=2 --mixed_precision=bf16 src/train.py
 
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))

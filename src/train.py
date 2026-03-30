@@ -5,6 +5,7 @@ from datetime import datetime
 
 import torch
 import wandb
+from accelerate import Accelerator
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -26,27 +27,23 @@ from utils import (
 CHECKPOINT_INTERVAL = 1000  # save a checkpoint every N batches
 CHECKPOINT_DIR = "./checkpoints"
 
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.mps.is_available()
-    else "cpu"
-)  # only run this on nvidia hardware
-
-LOGGER.info(f"accelerator type: {device}")
-
-# FIX 1 (OOM): Tell PyTorch's allocator to use expandable segments
-# to reduce fragmentation before we even start.
+# Tell PyTorch's allocator to use expandable segments to reduce fragmentation.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 
 def main():
+    accelerator = Accelerator(mixed_precision="bf16")
+    device = accelerator.device
+
+    if accelerator.is_main_process:
+        LOGGER.info(f"accelerator: {accelerator.state}")
+
     experiment_id = os.getenv("EXPERIMENT_ID", uuid.uuid4().hex[:8])
 
-    LOGGER.info("=" * 60)
-    LOGGER.info("EXPERIMENT ID: %s", experiment_id)
-    LOGGER.info("=" * 60)
+    if accelerator.is_main_process:
+        LOGGER.info("=" * 60)
+        LOGGER.info("EXPERIMENT ID: %s", experiment_id)
+        LOGGER.info("=" * 60)
 
     PROCESSOR_NAME = os.getenv("PROCESSOR_NAME", "Qwen/Qwen3.5-0.8B")
     MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3.5-0.8B")
@@ -62,7 +59,7 @@ def main():
     INFONCE_TEMP = float(os.getenv("INFONCE_TEMP", 0.1))
     DIVERSITY_WEIGHT = float(os.getenv("DIVERSITY_WEIGHT", 0.1))
     EPOCHS = int(os.getenv("EPOCHS", 1))
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", 64))  # = B
+    BATCH_SIZE = int(os.getenv("BATCH_SIZE", 32))  # per-GPU batch size
     NUM_WORKERS = int(os.getenv("NUM_WORKERS", 8))
     NUM_BATCHES = int(os.getenv("NUM_BATCHES", (1024 * 128) // BATCH_SIZE))
 
@@ -79,53 +76,55 @@ def main():
     if os.getenv("EXPERIMENT_ID"):  # only attempt resume on explicit IDs
         resume_ckpt_path = find_latest_checkpoint(experiment_id, CHECKPOINT_DIR)
 
-    run = wandb.init(
-        # Set the wandb entity where your project will be logged (generally your team name).
-        entity="anishchaudhary2706-indian-institute-of-science",
-        # Set the wandb project where this run will be logged.
-        project="collm",
-        resume="allow" if resume_ckpt_path else None,
-        # Track hyperparameters and run metadata.
-        config={
-            # Identifiers
-            "experiment_id": experiment_id,
-            # Model
-            "processor_name": PROCESSOR_NAME,
-            "model_name": MODEL_NAME,
-            "keep_layers": KEEP_LAYERS,
-            # Architecture
-            "proj_dim": PROJ_DIM,
-            "num_embs": NUM_EMBS,
-            "hid_dim": HID_DIM,
-            # Training
-            "epochs": EPOCHS,
-            "batch_size": BATCH_SIZE,
-            "num_workers": NUM_WORKERS,
-            "num_batches": NUM_BATCHES,
-            # Loss & Temperature
-            "probe_temp": PROBE_TEMP,
-            "infonce_temp": INFONCE_TEMP,
-            "diversity_weight": DIVERSITY_WEIGHT,
-        },
-    )
+    run = None
+    if accelerator.is_main_process:
+        run = wandb.init(
+            entity="anishchaudhary2706-indian-institute-of-science",
+            project="collm",
+            resume="allow" if resume_ckpt_path else None,
+            config={
+                # Identifiers
+                "experiment_id": experiment_id,
+                # Model
+                "processor_name": PROCESSOR_NAME,
+                "model_name": MODEL_NAME,
+                "keep_layers": KEEP_LAYERS,
+                # Architecture
+                "proj_dim": PROJ_DIM,
+                "num_embs": NUM_EMBS,
+                "hid_dim": HID_DIM,
+                # Training
+                "epochs": EPOCHS,
+                "batch_size": BATCH_SIZE,
+                "num_gpus": accelerator.num_processes,
+                "num_workers": NUM_WORKERS,
+                "num_batches": NUM_BATCHES,
+                # Loss & Temperature
+                "probe_temp": PROBE_TEMP,
+                "infonce_temp": INFONCE_TEMP,
+                "diversity_weight": DIVERSITY_WEIGHT,
+            },
+        )
 
-    LOGGER.info("=" * 60)
-    LOGGER.info("HYPERPARAMETERS")
-    LOGGER.info("=" * 60)
-    LOGGER.info("  %-20s %s", "PROCESSOR_NAME:", PROCESSOR_NAME)
-    LOGGER.info("  %-20s %s", "MODEL_NAME:", MODEL_NAME)
-    LOGGER.info("  %-20s %s", "PROJ_DIM:", PROJ_DIM)
-    LOGGER.info("  %-20s %s", "NUM_EMBS:", NUM_EMBS)
-    LOGGER.info("  %-20s %s", "HID_DIM:", HID_DIM)
-    LOGGER.info("  %-20s %s", "KEEP_LAYERS:", KEEP_LAYERS)
-    LOGGER.info("  %-20s %s", "PROBE_TEMP:", PROBE_TEMP)
-    LOGGER.info("  %-20s %s", "INFONCE_TEMP:", INFONCE_TEMP)
-    LOGGER.info("  %-20s %s", "DIVERSITY_WEIGHT:", DIVERSITY_WEIGHT)
-    LOGGER.info("  %-20s %s", "EPOCHS:", EPOCHS)
-    LOGGER.info("  %-20s %s", "BATCH_SIZE:", BATCH_SIZE)
-    LOGGER.info("  %-20s %s", "NUM_WORKERS:", NUM_WORKERS)
-    LOGGER.info("  %-20s %s", "NUM_BATCHES:", NUM_BATCHES)
-    LOGGER.info("=" * 60)
+    if accelerator.is_main_process:
+        LOGGER.info("=" * 60)
+        LOGGER.info("HYPERPARAMETERS")
+        LOGGER.info("=" * 60)
+        LOGGER.info("  %-20s %s", "PROCESSOR_NAME:", PROCESSOR_NAME)
+        LOGGER.info("  %-20s %s", "MODEL_NAME:", MODEL_NAME)
+        LOGGER.info("  %-20s %s", "PROJ_DIM:", PROJ_DIM)
+        LOGGER.info("  %-20s %s", "NUM_EMBS:", NUM_EMBS)
+        LOGGER.info("  %-20s %s", "HID_DIM:", HID_DIM)
+        LOGGER.info("  %-20s %s", "KEEP_LAYERS:", KEEP_LAYERS)
+        LOGGER.info("  %-20s %s", "PROBE_TEMP:", PROBE_TEMP)
+        LOGGER.info("  %-20s %s", "INFONCE_TEMP:", INFONCE_TEMP)
+        LOGGER.info("  %-20s %s", "DIVERSITY_WEIGHT:", DIVERSITY_WEIGHT)
+        LOGGER.info("  %-20s %s", "EPOCHS:", EPOCHS)
+        LOGGER.info("  %-20s %s", "BATCH_SIZE (per GPU):", BATCH_SIZE)
+        LOGGER.info("  %-20s %s", "NUM_GPUS:", accelerator.num_processes)
+        LOGGER.info("  %-20s %s", "NUM_WORKERS:", NUM_WORKERS)
+        LOGGER.info("  %-20s %s", "NUM_BATCHES:", NUM_BATCHES)
+        LOGGER.info("=" * 60)
 
     LOGGER.info("Loading processor: %s", PROCESSOR_NAME)
     processor = AutoProcessor.from_pretrained(PROCESSOR_NAME, trust_remote_code=True)
@@ -138,10 +137,11 @@ def main():
         num_embeddings=NUM_EMBS,
         hidden_dim=HID_DIM,
         keep_layers=KEEP_LAYERS,
+        device=device,
     )
-    model = model.to(device)
     # model = torch.compile(model, mode="reduce-overhead")
-    param_summary(model, LOGGER)
+    if accelerator.is_main_process:
+        param_summary(model, LOGGER)
     LOGGER.info("Model loaded and ready")
 
     model.model.model.language_model.gradient_checkpointing_enable(
@@ -182,9 +182,10 @@ def main():
         num_warmup_steps=500,
         num_training_steps=NUM_BATCHES * 5,  # so only decays lr to 80%
     )
+
     # ------------------------------------------------------------------
     # Restore checkpoint state (model weights, optimizer, scheduler, etc.)
-    # Must happen *after* model + optimizer + scheduler are constructed.
+    # Must happen *before* accelerator.prepare so we load into the raw model.
     # ------------------------------------------------------------------
     skipped = 0
     if resume_ckpt_path:
@@ -206,8 +207,19 @@ def main():
     else:
         LOGGER.info("Starting fresh training run")
 
+    # ------------------------------------------------------------------
+    # Wrap model, optimizer, dataloader, scheduler with accelerate.
+    # This enables DDP across all available GPUs.
+    # ------------------------------------------------------------------
+    model, optimizer, train_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, scheduler
+    )
+    # raw_model gives direct access to CoLLM attributes (probe_router, cls_probes)
+    # without going through the DDP wrapper.
+    raw_model = accelerator.unwrap_model(model)
+
     LOGGER.info("Starting training for %d epoch(s)", EPOCHS)
-    LOGGER.info("Training on total exmaples: %d", NUM_BATCHES * BATCH_SIZE)
+    LOGGER.info("Training on total examples: %d", NUM_BATCHES * BATCH_SIZE)
 
     for epoch in range(EPOCHS):
         LOGGER.info("Running epoch %d/%d", epoch + 1, EPOCHS)
@@ -224,6 +236,7 @@ def main():
             total=NUM_BATCHES - start_batch,
             file=sys.stdout,
             leave=False,
+            disable=not accelerator.is_main_process,
         )
         loader_iter = iter(train_loader)
 
@@ -241,7 +254,7 @@ def main():
             model.train()
             optimizer.zero_grad()
 
-            # forwars pass
+            # forward pass
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 embeddings = model.forward(
                     images=batch["image"],
@@ -278,7 +291,8 @@ def main():
                     temp_start=PROBE_TEMP,
                     temp_end=0.1,
                 )
-                probe_logits = model.probe_router(embeddings.mean(dim=1))  # (B, K)
+                # Use raw_model to access CoLLM attributes through DDP wrapper
+                probe_logits = raw_model.probe_router(embeddings.mean(dim=1))  # (B, K)
                 probe_weights = torch.softmax(
                     probe_logits / current_probe_temp, dim=1
                 )  # (B, K)
@@ -295,10 +309,10 @@ def main():
                 labels = torch.arange(logits.size(0), device=device)  # (B,)
 
                 # Regularise cls_probes directly — they live in a fixed hidden_dim space
-                # calulates sum of square of cosine similarity between probes
+                # calculates sum of square of cosine similarity between probes
                 probe_gram = torch.mm(
-                    F.normalize(model.cls_probes, dim=-1),
-                    F.normalize(model.cls_probes, dim=-1).T,
+                    F.normalize(raw_model.cls_probes, dim=-1),
+                    F.normalize(raw_model.cls_probes, dim=-1).T,
                 )  # (K, K)
                 off_diag = probe_gram.masked_fill(
                     torch.eye(NUM_EMBS, device=device, dtype=torch.bool), 0.0
@@ -320,42 +334,44 @@ def main():
                 ) / 2 + DIVERSITY_WEIGHT * (diversity_loss + output_diversity_loss)
 
             # backward pass — del after backward so the autograd graph is released
-            loss.backward()
+            accelerator.backward(loss)
             loss_val = loss.item()
             del target_emb, best_emb, logits, embeddings, loss
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
             pbar.update(1)
 
-            run.log(
-                {
-                    "batch_idx": batch_idx + 1,
-                    "loss": loss_val,
-                    "lr": scheduler.get_last_lr()[0],
-                    "probe_temp": current_probe_temp,
-                }
-            )
+            if accelerator.is_main_process:
+                run.log(
+                    {
+                        "batch_idx": batch_idx + 1,
+                        "loss": loss_val,
+                        "lr": scheduler.get_last_lr()[0],
+                        "probe_temp": current_probe_temp,
+                    }
+                )
 
             # ----------------------------------------------------------
             # Periodic checkpoint (every CHECKPOINT_INTERVAL batches)
             # batch_idx is 0-based, so we trigger at 999, 1999, …
             # ----------------------------------------------------------
             if (batch_idx + 1) % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(
-                    experiment_id,
-                    epoch,
-                    batch_idx,
-                    model,
-                    optimizer,
-                    scheduler,
-                    skipped,
-                    CHECKPOINT_DIR,
-                    LOGGER,
-                )
+                if accelerator.is_main_process:
+                    save_checkpoint(
+                        experiment_id,
+                        epoch,
+                        batch_idx,
+                        raw_model,
+                        optimizer,
+                        scheduler,
+                        skipped,
+                        CHECKPOINT_DIR,
+                        LOGGER,
+                    )
 
-            if batch_idx % 10 == 0:
+            if accelerator.is_main_process and batch_idx % 10 == 0:
                 LOGGER.info(
                     "Epoch=%d batch=%d | loss=%.4f | lr=%.2e\n",
                     epoch + 1,
@@ -363,31 +379,33 @@ def main():
                     loss_val,
                     scheduler.get_last_lr()[0],
                 )
-                log_vram(f"epoch={epoch + 1} batch={batch_idx + 1}", LOGGER, device)
+                log_vram(f"epoch={epoch + 1} batch={batch_idx + 1}", LOGGER, "cuda")
         pbar.close()
-        log_vram(f"epoch={epoch + 1} end", LOGGER, device)
+        if accelerator.is_main_process:
+            log_vram(f"epoch={epoch + 1} end", LOGGER, "cuda")
 
         # Also checkpoint at the end of each epoch so epoch boundaries are
         # always recoverable even if CHECKPOINT_INTERVAL doesn't land there.
-        save_checkpoint(
-            experiment_id,
-            epoch,
-            NUM_BATCHES - 1,
-            model,
-            optimizer,
-            scheduler,
-            skipped,
-            CHECKPOINT_DIR,
-            LOGGER,
-        )
+        if accelerator.is_main_process:
+            save_checkpoint(
+                experiment_id,
+                epoch,
+                NUM_BATCHES - 1,
+                raw_model,
+                optimizer,
+                scheduler,
+                skipped,
+                CHECKPOINT_DIR,
+                LOGGER,
+            )
 
-    LOGGER.info("saving model to CoLLM.pt")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_filename = f"collm_4probes_{experiment_id}_{timestamp}.pt"
-    torch.save(model.state_dict(), model_filename)
-    LOGGER.info(f"Model saved as: {model_filename}")
-
-    run.finish()
+    if accelerator.is_main_process:
+        LOGGER.info("saving model to CoLLM.pt")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_filename = f"collm_4probes_{experiment_id}_{timestamp}.pt"
+        torch.save(raw_model.state_dict(), model_filename)
+        LOGGER.info(f"Model saved as: {model_filename}")
+        run.finish()
 
 
 if __name__ == "__main__":

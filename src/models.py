@@ -89,7 +89,7 @@ class CoLLM(torch.nn.Module):
 
     def forward(self, images, text, processor):
         inputs = self.make_inputs(processor, images, text)
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = self.model.model(
                 **inputs, output_hidden_states=False, return_dict=True
             )
