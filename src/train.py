@@ -18,6 +18,7 @@ from models import CoLLM
 from utils import (
     collm_contrastive_collate_fn,
     find_latest_checkpoint,
+    gather_with_grad,
     get_probe_temp,
     log_vram,
     param_summary,
@@ -303,10 +304,15 @@ def main():
                 best_emb = F.normalize(best_emb, dim=-1)  # re-normalise to be exact
 
                 # --- symmetric InfoNCE loss ---
-                # Logit matrix: each query's composed embedding vs every target in batch.
-                # Diagonal entries are the positives.
-                logits = torch.matmul(best_emb, target_emb.T) / INFONCE_TEMP  # (B, B)
-                labels = torch.arange(logits.size(0), device=device)  # (B,)
+                # Gather embeddings across all GPUs so every process sees the
+                # full batch as negatives (B*num_gpus negatives per query).
+                # GatherLayer preserves gradient flow to the local process's slice.
+                # target_emb has no grad (frozen CLIP), so plain gather suffices.
+                all_best_emb = gather_with_grad(best_emb)      # (B*N, P)
+                all_target_emb = accelerator.gather(target_emb)  # (B*N, P)
+
+                logits = torch.matmul(all_best_emb, all_target_emb.T) / INFONCE_TEMP  # (B*N, B*N)
+                labels = torch.arange(logits.size(0), device=device)  # (B*N,)
 
                 # Regularise cls_probes directly — they live in a fixed hidden_dim space
                 # calculates sum of square of cosine similarity between probes
@@ -336,7 +342,7 @@ def main():
             # backward pass — del after backward so the autograd graph is released
             accelerator.backward(loss)
             loss_val = loss.item()
-            del target_emb, best_emb, logits, embeddings, loss
+            del target_emb, best_emb, all_best_emb, all_target_emb, logits, embeddings, loss
             accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()

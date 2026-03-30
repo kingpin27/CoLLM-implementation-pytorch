@@ -3,6 +3,38 @@ import os
 import subprocess
 
 import torch
+import torch.distributed as dist
+
+
+class GatherLayer(torch.autograd.Function):
+    """All-gather with gradient flow back to the local process.
+
+    forward : concatenates tensors from all ranks → (B*N, ...)
+    backward: all-reduces incoming grads, then returns only the local slice
+              so gradients flow correctly to each process's own embeddings.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, x.contiguous())
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        all_grads = torch.stack(grads)
+        dist.all_reduce(all_grads)
+        return all_grads[dist.get_rank()]
+
+
+def gather_with_grad(x):
+    """Gather x from all processes, keeping gradients for the local slice.
+
+    Falls back to a no-op on single-GPU runs where dist is not initialised.
+    """
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return x
+    return torch.cat(GatherLayer.apply(x), dim=0)
 
 
 # Before your training loop
