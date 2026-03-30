@@ -325,9 +325,10 @@ def main():
                 )
                 diversity_loss = (off_diag**2).sum()
 
-                # diversity in output embedding space across the batch
-                # embeddings: (B, K, P)
-                mean_probes = F.normalize(embeddings.mean(dim=0), dim=-1)  # (K, P)
+                # diversity in output embedding space across the full global batch
+                # gather embeddings from all GPUs so mean is over B*N samples, not just B
+                all_embeddings = gather_with_grad(embeddings)  # (B*N, K, P)
+                mean_probes = F.normalize(all_embeddings.mean(dim=0), dim=-1)  # (K, P)
                 output_gram = torch.mm(mean_probes, mean_probes.T)  # (K, K)
                 output_off_diag = output_gram.masked_fill(
                     torch.eye(NUM_EMBS, device=device, dtype=torch.bool), 0.0
@@ -342,7 +343,7 @@ def main():
             # backward pass — del after backward so the autograd graph is released
             accelerator.backward(loss)
             loss_val = loss.item()
-            del target_emb, best_emb, all_best_emb, all_target_emb, logits, embeddings, loss
+            del target_emb, best_emb, all_best_emb, all_target_emb, all_embeddings, logits, embeddings, loss
             accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
