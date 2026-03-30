@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=train_collm
-#SBATCH --partition=a100
+#SBATCH --partition=ada
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -53,7 +53,7 @@ export KEEP_LAYERS=16
 export EPOCHS=1
 export BATCH_SIZE=64
 export NUM_WORKERS=4
-export NUM_BATCHES=$(( (1024 * 1024) / BATCH_SIZE ))
+export NUM_BATCHES=$(( (1024 * 512) / BATCH_SIZE ))
 
 export PROBE_TEMP=1.0
 export INFONCE_TEMP=0.07

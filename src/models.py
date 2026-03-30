@@ -89,6 +89,10 @@ class CoLLM(torch.nn.Module):
 
     def forward(self, images, text, processor):
         inputs = self.make_inputs(processor, images, text)
+        if not hasattr(self, "_seq_len_logged"):
+            self._seq_len_logged = True
+            print(f"[DEBUG] input_ids shape: {inputs['input_ids'].shape}  "
+                  f"(seq_len={inputs['input_ids'].shape[1]})", flush=True)
         with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
             outputs = self.model.model(
                 **inputs, output_hidden_states=False, return_dict=True
