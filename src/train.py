@@ -144,9 +144,12 @@ def main():
     param_summary(model, LOGGER)
     LOGGER.info("Model loaded and ready")
 
-    model.model.model.language_model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
+    # Gradient checkpointing disabled: with max_pixels capping seq_len to ~242,
+    # 16-layer activations are ~2-3 GB — manageable without recomputation.
+    # Checkpointing was causing staircase VRAM growth from recomputation peaks.
+    # model.model.model.language_model.gradient_checkpointing_enable(
+    #     gradient_checkpointing_kwargs={"use_reentrant": False}
+    # )
 
     LOGGER.info(
         "Creating dataset from %s", "./MTCIR/mtcir_expanded_shuffled_safe.jsonl"
