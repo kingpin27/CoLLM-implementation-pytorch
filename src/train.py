@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 
 import torch
+import torch.distributed as dist
 import wandb
 from accelerate import Accelerator
 from PIL import Image
@@ -352,6 +353,19 @@ def main():
         for batch_idx, batch in enumerate(loader_iter):
             if batch is None:
                 continue
+
+            # Synchronise batch sizes across ranks before any all-gather.
+            # collm_contrastive_collate_fn drops failed samples, which can leave
+            # ranks with unequal batch sizes — causing NCCL ALLGATHER to deadlock.
+            if accelerator.num_processes > 1:
+                local_size = torch.tensor(len(batch["id"]), device=device)
+                dist.all_reduce(local_size, op=dist.ReduceOp.MIN)
+                min_size = int(local_size.item())
+                if min_size == 0:
+                    continue
+                if min_size < len(batch["id"]):
+                    batch = {k: v[:min_size] for k, v in batch.items()}
+
             if batch_idx >= NUM_BATCHES:
                 break
             model.train()
