@@ -4,6 +4,7 @@ import subprocess
 
 import torch
 import torch.distributed as dist
+from torch.nn import functional as F
 
 
 class GatherLayer(torch.autograd.Function):
@@ -35,6 +36,112 @@ def gather_with_grad(x):
     if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
         return x
     return torch.cat(GatherLayer.apply(x), dim=0)
+
+
+class NegativeQueue:
+    """FIFO queue of frozen target CLIP embeddings for expanding the InfoNCE negative set.
+
+    Since target embeddings are pre-computed frozen CLIP vectors (no grad), the queue
+    requires no momentum encoder — just store and replay them as extra negatives.
+    All ranks enqueue the same gathered embeddings, so queues stay in sync automatically.
+    """
+
+    def __init__(self, queue_size: int, embed_dim: int, device):
+        self.queue_size = queue_size
+        self.buffer = torch.zeros(queue_size, embed_dim, device=device)
+        self.ptr = 0
+        self.filled = 0
+
+    @torch.no_grad()
+    def enqueue(self, embeddings: torch.Tensor):
+        """Enqueue embeddings (N, D), overwriting oldest entries when full."""
+        N = embeddings.shape[0]
+        emb = embeddings.detach()
+        if N >= self.queue_size:
+            self.buffer.copy_(emb[-self.queue_size:])
+            self.ptr = 0
+            self.filled = self.queue_size
+            return
+        end = self.ptr + N
+        if end <= self.queue_size:
+            self.buffer[self.ptr:end].copy_(emb)
+        else:
+            split = self.queue_size - self.ptr
+            self.buffer[self.ptr:].copy_(emb[:split])
+            self.buffer[:end - self.queue_size].copy_(emb[split:])
+        self.ptr = end % self.queue_size
+        self.filled = min(self.filled + N, self.queue_size)
+
+    def get(self) -> torch.Tensor:
+        """Return all valid embeddings currently in the queue."""
+        if self.filled == self.queue_size:
+            return self.buffer.clone()
+        return self.buffer[:self.filled].clone()
+
+    def __len__(self) -> int:
+        return self.filled
+
+
+def hard_infonce_loss(
+    query_emb: torch.Tensor,
+    target_emb: torch.Tensor,
+    temp: float,
+    k_hard: int,
+    queue_emb: torch.Tensor = None,
+) -> torch.Tensor:
+    """Symmetric InfoNCE with hard negative mining.
+
+    query-to-target direction: mine top-k_hard negatives from batch + queue per query.
+    target-to-query direction: standard InfoNCE within current batch only
+                               (queue entries have no paired queries).
+
+    Args:
+        query_emb:  (B, P) gathered query embeddings — grads flow through these.
+        target_emb: (B, P) gathered true-positive target embeddings — no grad.
+        temp:       InfoNCE temperature.
+        k_hard:     Hard negatives per query. 0 = standard InfoNCE over full pool.
+        queue_emb:  (Q, P) queued negatives, or None if queue is empty.
+    """
+    B = query_emb.shape[0]
+
+    # Build negative pool: [current-batch targets | queue]
+    if queue_emb is not None and queue_emb.shape[0] > 0:
+        neg_pool = torch.cat([target_emb, queue_emb], dim=0)  # (B+Q, P)
+    else:
+        neg_pool = target_emb  # (B, P)
+
+    M = neg_pool.shape[0]
+
+    # --- query → target (with hard mining if k_hard > 0 and pool is large enough) ---
+    sims = torch.matmul(query_emb, neg_pool.T)  # (B, M)
+
+    if k_hard > 0 and k_hard < M - 1:
+        # Mask true positives (diagonal of first B columns) before mining
+        tp_mask = torch.zeros(B, M, dtype=torch.bool, device=query_emb.device)
+        tp_mask[torch.arange(B), torch.arange(B)] = True
+        mining_sims = sims.masked_fill(tp_mask, float("-inf"))
+
+        _, hard_idx = mining_sims.topk(k_hard, dim=1)              # (B, k_hard)
+        hard_negs = neg_pool[hard_idx]                               # (B, k_hard, P)
+
+        pos_sim = (query_emb * target_emb).sum(dim=-1, keepdim=True) / temp   # (B, 1)
+        hard_sim = torch.bmm(hard_negs, query_emb.unsqueeze(-1)).squeeze(-1) / temp  # (B, k_hard)
+
+        logits_q2t = torch.cat([pos_sim, hard_sim], dim=1)          # (B, 1+k_hard)
+        labels_q2t = torch.zeros(B, dtype=torch.long, device=query_emb.device)
+    else:
+        # Standard InfoNCE over full pool (k_hard=0 or pool too small)
+        logits_q2t = sims / temp                                     # (B, M)
+        labels_q2t = torch.arange(B, device=query_emb.device)
+
+    loss_q2t = F.cross_entropy(logits_q2t, labels_q2t)
+
+    # --- target → query (current batch only) ---
+    logits_t2q = torch.matmul(target_emb, query_emb.T) / temp       # (B, B)
+    labels_t2q = torch.arange(B, device=query_emb.device)
+    loss_t2q = F.cross_entropy(logits_t2q, labels_t2q)
+
+    return (loss_q2t + loss_t2q) / 2
 
 
 # Before your training loop

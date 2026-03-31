@@ -19,10 +19,12 @@ from dataset import MTCIRDataset
 from logger import LOGGER
 from models import CoLLM
 from utils import (
+    NegativeQueue,
     collm_contrastive_collate_fn,
     find_latest_checkpoint,
     gather_with_grad,
     get_probe_temp,
+    hard_infonce_loss,
     log_vram,
     param_summary,
     save_checkpoint,
@@ -122,6 +124,9 @@ def main():
     NUM_WORKERS = int(os.getenv("NUM_WORKERS", 8))
     NUM_BATCHES = int(os.getenv("NUM_BATCHES", (1024 * 128) // BATCH_SIZE))
 
+    QUEUE_SIZE = int(os.getenv("QUEUE_SIZE", 4096))   # negatives stored in queue
+    K_HARD = int(os.getenv("K_HARD", 64))             # hard negatives per query (0=disabled)
+
     VAL_INTERVAL = int(os.getenv("VAL_INTERVAL", 500))
     CIRCO_VAL_ANNOTATIONS = os.getenv("CIRCO_VAL_ANNOTATIONS")  # path to val.json
     CIRCO_COCO_IMG_DIR = os.getenv("CIRCO_COCO_IMG_DIR")        # path to unlabeled2017/
@@ -170,6 +175,9 @@ def main():
                 "probe_temp": PROBE_TEMP,
                 "infonce_temp": INFONCE_TEMP,
                 "diversity_weight": DIVERSITY_WEIGHT,
+                # Hard sampling
+                "queue_size": QUEUE_SIZE,
+                "k_hard": K_HARD,
             },
         )
 
@@ -186,6 +194,8 @@ def main():
         LOGGER.info("  %-20s %s", "PROBE_TEMP:", PROBE_TEMP)
         LOGGER.info("  %-20s %s", "INFONCE_TEMP:", INFONCE_TEMP)
         LOGGER.info("  %-20s %s", "DIVERSITY_WEIGHT:", DIVERSITY_WEIGHT)
+        LOGGER.info("  %-20s %s", "QUEUE_SIZE:", QUEUE_SIZE)
+        LOGGER.info("  %-20s %s", "K_HARD:", K_HARD)
         LOGGER.info("  %-20s %s", "EPOCHS:", EPOCHS)
         LOGGER.info("  %-20s %s", "BATCH_SIZE (per GPU):", BATCH_SIZE)
         LOGGER.info("  %-20s %s", "NUM_GPUS:", accelerator.num_processes)
@@ -284,6 +294,11 @@ def main():
     # raw_model gives direct access to CoLLM attributes (probe_router, cls_probes)
     # without going through the DDP wrapper.
     raw_model = accelerator.unwrap_model(model)
+
+    # Negative queue — stores gathered target CLIP embeddings from recent batches.
+    # No momentum encoder needed: target_emb is already frozen CLIP (no grad).
+    # All ranks enqueue the same all_target_emb, so queues stay in sync.
+    neg_queue = NegativeQueue(QUEUE_SIZE, PROJ_DIM, device)
 
     # ------------------------------------------------------------------
     # CIRCO validation setup — load gallery + val queries once up front.
@@ -419,16 +434,15 @@ def main():
                 )  # (B, P) — still unit-norm after softmax combination (approx)
                 best_emb = F.normalize(best_emb, dim=-1)  # re-normalise to be exact
 
-                # --- symmetric InfoNCE loss ---
+                # --- symmetric InfoNCE loss with hard negative mining + queue ---
                 # Gather embeddings across all GPUs so every process sees the
                 # full batch as negatives (B*num_gpus negatives per query).
                 # GatherLayer preserves gradient flow to the local process's slice.
                 # target_emb has no grad (frozen CLIP), so plain gather suffices.
-                all_best_emb = gather_with_grad(best_emb)      # (B*N, P)
+                all_best_emb = gather_with_grad(best_emb)        # (B*N, P)
                 all_target_emb = accelerator.gather(target_emb)  # (B*N, P)
 
-                logits = torch.matmul(all_best_emb, all_target_emb.T) / INFONCE_TEMP  # (B*N, B*N)
-                labels = torch.arange(logits.size(0), device=device)  # (B*N,)
+                queue_emb = neg_queue.get() if len(neg_queue) > 0 else None
 
                 # Regularise cls_probes directly — they live in a fixed hidden_dim space
                 # calculates sum of square of cosine similarity between probes
@@ -451,15 +465,16 @@ def main():
                 )
                 output_diversity_loss = (output_off_diag**2).sum()
 
-                loss = (
-                    F.cross_entropy(logits, labels)  # query -> target
-                    + F.cross_entropy(logits.T, labels)  # target -> query
-                ) / 2 + DIVERSITY_WEIGHT * (diversity_loss + output_diversity_loss)
+                infonce = hard_infonce_loss(
+                    all_best_emb, all_target_emb, INFONCE_TEMP, K_HARD, queue_emb
+                )
+                loss = infonce + DIVERSITY_WEIGHT * (diversity_loss + output_diversity_loss)
 
             # backward pass — del after backward so the autograd graph is released
             accelerator.backward(loss)
             loss_val = loss.item()
-            del target_emb, best_emb, all_best_emb, all_target_emb, all_embeddings, logits, embeddings, loss
+            neg_queue.enqueue(all_target_emb)  # grow negative pool for future batches
+            del target_emb, best_emb, all_best_emb, all_target_emb, all_embeddings, embeddings, loss
             accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
@@ -473,6 +488,7 @@ def main():
                         "loss": loss_val,
                         "lr": scheduler.get_last_lr()[0],
                         "probe_temp": current_probe_temp,
+                        "queue_size": len(neg_queue),
                     }
                 )
 
