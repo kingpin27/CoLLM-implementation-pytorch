@@ -59,6 +59,9 @@ export PROBE_TEMP=1.0
 export INFONCE_TEMP=0.07
 export DIVERSITY_WEIGHT=0.1
 
+export QUEUE_SIZE=4096
+export K_HARD=64
+
 export VAL_INTERVAL=500
 export CIRCO_VAL_ANNOTATIONS=~/CIRCO/annotations/val.json
 export CIRCO_COCO_IMG_DIR=~/CIRCO/COCO2017_unlabeled/unlabeled2017
