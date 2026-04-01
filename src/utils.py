@@ -16,7 +16,6 @@ def run_circo_val(
     coco_ids,
     val_queries,
     device,
-    probe_temp=0.1,
     batch_size=4,
 ):
     """Evaluate on CIRCO val split. Returns mAP@{5,10,25,50}, R@{1,5,10,25,50}."""
@@ -36,13 +35,9 @@ def run_circo_val(
         )  # (B, K, P)
         embeddings = F.normalize(embeddings.float(), dim=-1)
 
-        # learned_router aggregation — matches training
-        query_summary = embeddings.mean(dim=1)  # (B, P)
-        probe_logits = raw_model.probe_router(query_summary)  # (B, K)
-        probe_weights = torch.softmax(probe_logits / probe_temp, dim=1)  # (B, K)
-        best_emb = torch.einsum("bk,bkp->bp", probe_weights, embeddings)  # (B, P)
-        best_emb = F.normalize(best_emb, dim=-1)
-        sims = best_emb @ gallery_embs.T  # (B, N)
+        # max-pool aggregation — matches training (max over K probes per gallery item)
+        probe_sims = torch.einsum("bkp,np->bkn", embeddings, gallery_embs)  # (B, K, N)
+        sims = probe_sims.max(dim=1).values  # (B, N)
 
         for i, q in enumerate(batch):
             gt_ids = set(q["gt_img_ids"])
@@ -153,74 +148,70 @@ class NegativeQueue:
         return self.filled
 
 
-def hard_infonce_loss(
+def multiprobe_infonce_loss(
     query_emb: torch.Tensor,
     target_emb: torch.Tensor,
     temp: float,
     k_hard: int,
     queue_emb: torch.Tensor = None,
 ) -> torch.Tensor:
-    """Symmetric InfoNCE with hard negative mining.
+    """Symmetric InfoNCE with multi-probe max-similarity and hard negative mining.
+
+    For each (query, candidate) pair the similarity is the maximum dot product
+    across the K probe embeddings.  This lets probes specialise — gradient flows
+    only to the winning probe for each pair, so probes are pushed to cover
+    different aspects of the query.
 
     query-to-target direction: mine top-k_hard negatives from batch + queue per query.
     target-to-query direction: standard InfoNCE within current batch only
                                (queue entries have no paired queries).
 
     Args:
-        query_emb:  (B, P) gathered query embeddings — grads flow through these.
-        target_emb: (B, P) gathered true-positive target embeddings — no grad.
+        query_emb:  (B, K, P) gathered query probe embeddings — grads flow through these.
+        target_emb: (B, P)    gathered true-positive target embeddings — no grad.
         temp:       InfoNCE temperature.
         k_hard:     Hard negatives per query. 0 = standard InfoNCE over full pool.
         queue_emb:  (Q, P) queued negatives, or None if queue is empty.
     """
-    B = query_emb.shape[0]
+    B, K, P = query_emb.shape
 
-    # Build negative pool: [current-batch targets | queue]
     if queue_emb is not None and queue_emb.shape[0] > 0:
-        neg_pool = torch.cat([target_emb, queue_emb], dim=0)  # (B+Q, P)
+        neg_pool = torch.cat([target_emb, queue_emb], dim=0)  # (M, P)
     else:
         neg_pool = target_emb  # (B, P)
 
     M = neg_pool.shape[0]
 
-    # --- query → target (with hard mining if k_hard > 0 and pool is large enough) ---
-    sims = torch.matmul(query_emb, neg_pool.T)  # (B, M)
+    # Max similarity across K probes for every (query, candidate) pair
+    all_sims = torch.einsum("bkp,mp->bkm", query_emb, neg_pool)  # (B, K, M)
+    max_sims = all_sims.max(dim=1).values  # (B, M)
 
+    # --- query → target (with hard mining if k_hard > 0 and pool is large enough) ---
     if k_hard > 0 and k_hard < M - 1:
-        # Mask true positives (diagonal of first B columns) before mining
         tp_mask = torch.zeros(B, M, dtype=torch.bool, device=query_emb.device)
         tp_mask[torch.arange(B), torch.arange(B)] = True
-        mining_sims = sims.masked_fill(tp_mask, float("-inf"))
+        mining_sims = max_sims.masked_fill(tp_mask, float("-inf"))
 
         _, hard_idx = mining_sims.topk(k_hard, dim=1)  # (B, k_hard)
-        hard_negs = neg_pool[hard_idx]  # (B, k_hard, P)
 
-        pos_sim = (query_emb * target_emb).sum(dim=-1, keepdim=True) / temp  # (B, 1)
-        hard_sim = (
-            torch.bmm(hard_negs, query_emb.unsqueeze(-1)).squeeze(-1) / temp
-        )  # (B, k_hard)
+        pos_sim = max_sims[torch.arange(B), torch.arange(B)].unsqueeze(1) / temp  # (B, 1)
+        hard_sim = max_sims.gather(1, hard_idx) / temp  # (B, k_hard)
 
         logits_q2t = torch.cat([pos_sim, hard_sim], dim=1)  # (B, 1+k_hard)
         labels_q2t = torch.zeros(B, dtype=torch.long, device=query_emb.device)
     else:
-        # Standard InfoNCE over full pool (k_hard=0 or pool too small)
-        logits_q2t = sims / temp  # (B, M)
+        logits_q2t = max_sims / temp  # (B, M)
         labels_q2t = torch.arange(B, device=query_emb.device)
 
     loss_q2t = F.cross_entropy(logits_q2t, labels_q2t)
 
-    # --- target → query (current batch only) ---
-    logits_t2q = torch.matmul(target_emb, query_emb.T) / temp  # (B, B)
+    # --- target → query (current batch only, using the (B, B) submatrix) ---
+    logits_t2q = max_sims[:, :B].T / temp  # (B, B)
     labels_t2q = torch.arange(B, device=query_emb.device)
     loss_t2q = F.cross_entropy(logits_t2q, labels_t2q)
 
     return (loss_q2t + loss_t2q) / 2
 
-
-# Before your training loop
-def get_probe_temp(batch_idx, total_batches, temp_start=1.0, temp_end=0.1):
-    progress = min(batch_idx / total_batches, 1.0)
-    return temp_start * (temp_end / temp_start) ** progress  # exponential decay
 
 
 def save_checkpoint(

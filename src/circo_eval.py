@@ -102,7 +102,6 @@ def encode_queries_batch(
     images,
     texts,
     gallery_embs,
-    probe_temp: float,
     aggregation: str,
 ):
     """
@@ -110,20 +109,10 @@ def encode_queries_batch(
 
     aggregation choices
     -------------------
-    "learned_router"  — uses model.probe_router (query-conditioned MLP).
-                        Only available if you retrained with Fix 1 / Option B.
-                        Identical to training behaviour. USE THIS if available.
+    "max_pool"   — takes the max across K probes per gallery image.
+                   Matches the training loss (multiprobe_infonce_loss).
 
-    "max_pool"        — takes the max across K probes per gallery image.
-                        Strong baseline; no routing needed; consistent at
-                        train and test time.
-
-    "mean_pool"       — averages K probes then re-normalises.
-                        Weaker than max but still train/test consistent.
-
-    DO NOT use "gallery_mean" (the old approach) — it uses mean gallery
-    similarity as a proxy for probe relevance, which has no correspondence
-    to any training signal and is the root cause of train/test mismatch.
+    "mean_pool"  — averages K probes then re-normalises.
     """
     embeddings = model.forward(
         images=images,
@@ -131,37 +120,20 @@ def encode_queries_batch(
         processor=processor,
     )  # (B, K, P)
 
-    B, K, P = embeddings.shape
     embeddings = F.normalize(embeddings.float(), dim=-1)  # (B, K, P)
 
-    if aggregation == "learned_router":
-        # ── Query-conditioned routing (matches training if you applied Fix 1) ──
-        # model.probe_router: nn.Linear(PROJ_DIM, NUM_EMBS) or small MLP
-        # Input: mean of probe embeddings as a query-side summary — (B, P)
-        query_summary = embeddings.mean(dim=1)  # (B, P)
-        probe_logits = model.probe_router(query_summary)  # (B, K)
-        probe_weights = torch.softmax(probe_logits / probe_temp, dim=1)  # (B, K)
-        best_emb = torch.einsum("bk,bkp->bp", probe_weights, embeddings)  # (B, P)
-        best_emb = F.normalize(best_emb, dim=-1)
-        sims = best_emb @ gallery_embs.T  # (B, N)
-
-    elif aggregation == "max_pool":
-        # ── Max-pool across probes — no routing, fully consistent ──────────────
-        # For each query and each gallery image, take the highest-scoring probe.
-        # Shape: (B, K, N) → max over K → (B, N)
+    if aggregation == "max_pool":
         probe_sims = torch.einsum("bkp,np->bkn", embeddings, gallery_embs)  # (B, K, N)
         sims, _ = probe_sims.max(dim=1)  # (B, N)
 
     elif aggregation == "mean_pool":
-        # ── Mean-pool across probes ─────────────────────────────────────────────
         mean_emb = embeddings.mean(dim=1)  # (B, P)
         mean_emb = F.normalize(mean_emb, dim=-1)
         sims = mean_emb @ gallery_embs.T  # (B, N)
 
     else:
         raise ValueError(
-            f"Unknown aggregation '{aggregation}'. "
-            "Choose: learned_router | max_pool | mean_pool"
+            f"Unknown aggregation '{aggregation}'. Choose: max_pool | mean_pool"
         )
 
     return sims  # (B, N)
@@ -206,16 +178,7 @@ def main(args):
     model.to(device).eval()
 
     processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
-    print(
-        f"Model ready  |  aggregation={args.aggregation}  |  probe_temp={args.probe_temp}"
-    )
-
-    # Validate learned_router is actually available before iterating
-    if args.aggregation == "learned_router" and not hasattr(model, "probe_router"):
-        raise AttributeError(
-            "--aggregation learned_router requires model.probe_router to exist. "
-            "Either retrain with Fix 1 or use --aggregation max_pool instead."
-        )
+    print(f"Model ready  |  aggregation={args.aggregation}")
 
     batch_size = 4
 
@@ -234,7 +197,6 @@ def main(args):
             images=images,
             texts=texts,
             gallery_embs=gallery_embs,
-            probe_temp=args.probe_temp,
             aggregation=args.aggregation,
         )  # (B, N)
 
@@ -273,16 +235,11 @@ if __name__ == "__main__":
     parser.add_argument("--projection-dim", type=int, default=512)
     parser.add_argument("--num-embeddings", type=int, default=4)
     parser.add_argument("--hidden-dim", type=int, default=1024)
-    parser.add_argument("--probe-temp", type=float, default=1.0)
     parser.add_argument(
         "--aggregation",
         default="max_pool",
-        choices=["learned_router", "max_pool", "mean_pool"],
-        help=(
-            "How to combine K probe embeddings at inference. "
-            "'learned_router' requires retraining with Fix 1. "
-            "'max_pool' is the best drop-in for existing checkpoints."
-        ),
+        choices=["max_pool", "mean_pool"],
+        help="How to combine K probe embeddings at inference.",
     )
     args = parser.parse_args()
     main(args)

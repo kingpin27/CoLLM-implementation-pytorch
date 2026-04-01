@@ -55,7 +55,6 @@ export BATCH_SIZE=32
 export NUM_WORKERS=4
 export NUM_BATCHES=$(( (1024 * 512) / BATCH_SIZE ))
 
-export PROBE_TEMP=1.0
 export INFONCE_TEMP=0.07
 export DIVERSITY_WEIGHT=0.1
 

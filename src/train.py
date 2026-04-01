@@ -22,9 +22,8 @@ from utils import (
     collm_contrastive_collate_fn,
     find_latest_checkpoint,
     gather_with_grad,
-    get_probe_temp,
-    hard_infonce_loss,
     log_vram,
+    multiprobe_infonce_loss,
     param_summary,
     run_circo_val,
     save_checkpoint,
@@ -57,9 +56,6 @@ def main():
     NUM_EMBS = int(os.getenv("NUM_EMBS", 4))  # num of target proposals = K
     HID_DIM = int(os.getenv("HID_DIM", 1024))
     KEEP_LAYERS = int(os.getenv("KEEP_LAYERS", 16))
-    # Temperature for soft probe selection — lower = closer to hard argmax.
-    # Can be annealed toward 0 over training for increasingly competitive probes.
-    PROBE_TEMP = float(os.getenv("PROBE_TEMP", 1))
     # Temperature for InfoNCE contrastive loss.
     # 0.07 (CLIP default) is aggressive early in training; 0.1 is safer to start.
     INFONCE_TEMP = float(os.getenv("INFONCE_TEMP", 0.1))
@@ -117,7 +113,6 @@ def main():
                 "num_workers": NUM_WORKERS,
                 "num_batches": NUM_BATCHES,
                 # Loss & Temperature
-                "probe_temp": PROBE_TEMP,
                 "infonce_temp": INFONCE_TEMP,
                 "diversity_weight": DIVERSITY_WEIGHT,
                 # Hard sampling
@@ -136,7 +131,6 @@ def main():
         LOGGER.info("  %-20s %s", "NUM_EMBS:", NUM_EMBS)
         LOGGER.info("  %-20s %s", "HID_DIM:", HID_DIM)
         LOGGER.info("  %-20s %s", "KEEP_LAYERS:", KEEP_LAYERS)
-        LOGGER.info("  %-20s %s", "PROBE_TEMP:", PROBE_TEMP)
         LOGGER.info("  %-20s %s", "INFONCE_TEMP:", INFONCE_TEMP)
         LOGGER.info("  %-20s %s", "DIVERSITY_WEIGHT:", DIVERSITY_WEIGHT)
         LOGGER.info("  %-20s %s", "QUEUE_SIZE:", QUEUE_SIZE)
@@ -236,7 +230,7 @@ def main():
     model, optimizer, train_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, scheduler
     )
-    # raw_model gives direct access to CoLLM attributes (probe_router, cls_probes)
+    # raw_model gives direct access to CoLLM attributes (cls_probes, etc.)
     # without going through the DDP wrapper.
     raw_model = accelerator.unwrap_model(model)
 
@@ -374,31 +368,10 @@ def main():
                 ).to(device)  # (B, P)
                 target_emb = F.normalize(target_emb, dim=-1)  # (B, P)
 
-                # --- soft probe selection (fully differentiable) ---
-                # input-conditioned routing (query-side only, no target)
-                current_probe_temp = get_probe_temp(
-                    batch_idx + start_batch,
-                    NUM_BATCHES * EPOCHS,
-                    temp_start=PROBE_TEMP,
-                    temp_end=0.1,
-                )
-                # Use raw_model to access CoLLM attributes through DDP wrapper
-                probe_logits = raw_model.probe_router(embeddings.mean(dim=1))  # (B, K)
-                probe_weights = torch.softmax(
-                    probe_logits / current_probe_temp, dim=1
-                )  # (B, K)
-
-                best_emb = torch.einsum(
-                    "bk,bkp->bp", probe_weights, embeddings
-                )  # (B, P) — still unit-norm after softmax combination (approx)
-                best_emb = F.normalize(best_emb, dim=-1)  # re-normalise to be exact
-
-                # --- symmetric InfoNCE loss with hard negative mining + queue ---
-                # Gather embeddings across all GPUs so every process sees the
-                # full batch as negatives (B*num_gpus negatives per query).
+                # --- gather across GPUs ---
                 # GatherLayer preserves gradient flow to the local process's slice.
                 # target_emb has no grad (frozen CLIP), so plain gather suffices.
-                all_best_emb = gather_with_grad(best_emb)  # (B*N, P)
+                all_embeddings = gather_with_grad(embeddings)  # (B*N, K, P)
                 all_target_emb = accelerator.gather(target_emb)  # (B*N, P)
 
                 queue_emb = neg_queue.get() if len(neg_queue) > 0 else None
@@ -415,8 +388,6 @@ def main():
                 diversity_loss = (off_diag**2).sum()
 
                 # diversity in output embedding space across the full global batch
-                # gather embeddings from all GPUs so mean is over B*N samples, not just B
-                all_embeddings = gather_with_grad(embeddings)  # (B*N, K, P)
                 mean_probes = F.normalize(all_embeddings.mean(dim=0), dim=-1)  # (K, P)
                 output_gram = torch.mm(mean_probes, mean_probes.T)  # (K, K)
                 output_off_diag = output_gram.masked_fill(
@@ -424,8 +395,8 @@ def main():
                 )
                 output_diversity_loss = (output_off_diag**2).sum()
 
-                infonce = hard_infonce_loss(
-                    all_best_emb, all_target_emb, INFONCE_TEMP, K_HARD, queue_emb
+                infonce = multiprobe_infonce_loss(
+                    all_embeddings, all_target_emb, INFONCE_TEMP, K_HARD, queue_emb
                 )
                 loss = infonce + DIVERSITY_WEIGHT * (
                     diversity_loss + output_diversity_loss
@@ -437,8 +408,6 @@ def main():
             neg_queue.enqueue(all_target_emb)  # grow negative pool for future batches
             del (
                 target_emb,
-                best_emb,
-                all_best_emb,
                 all_target_emb,
                 all_embeddings,
                 embeddings,
@@ -456,7 +425,6 @@ def main():
                         "batch_idx": batch_idx + 1,
                         "loss": loss_val,
                         "lr": scheduler.get_last_lr()[0],
-                        "probe_temp": current_probe_temp,
                         "queue_size": len(neg_queue),
                     }
                 )
@@ -477,7 +445,6 @@ def main():
                     coco_ids_val,
                     val_queries,
                     device,
-                    probe_temp=0.1,
                 )
                 run.log({"batch_idx": batch_idx + 1, **val_metrics})
                 LOGGER.info(

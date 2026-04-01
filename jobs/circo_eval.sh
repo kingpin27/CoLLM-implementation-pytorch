@@ -44,8 +44,8 @@ srun python src/circo_eval.py \
     --coco-img-dir ~/CIRCO/COCO2017_unlabeled/unlabeled2017  \
     --coco-image-info ~/CIRCO/COCO2017_unlabeled/annotations/image_info_unlabeled2017.json \
     --output ~/CoLLM-implementation-pytorch/submission_test_645f4850.json \
-    --probe-temp 1.0 \
     --num-embeddings 4
+
 end_ts=$(date +%s)
 elapsed_sec=$((end_ts - start_ts))
 echo "CIRCO eval finished at: $(date '+%Y-%m-%d %H:%M:%S')"
