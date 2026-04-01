@@ -4,7 +4,74 @@ import subprocess
 
 import torch
 import torch.distributed as dist
+from PIL import Image
 from torch.nn import functional as F
+
+
+@torch.no_grad()
+def run_circo_val(
+    raw_model,
+    processor,
+    gallery_embs,
+    coco_ids,
+    val_queries,
+    device,
+    probe_temp=0.1,
+    batch_size=4,
+):
+    """Evaluate on CIRCO val split. Returns mAP@{5,10,25,50}, R@{1,5,10,25,50}."""
+    raw_model.eval()
+
+    ap_ks = {5: [], 10: [], 25: [], 50: []}
+    recall_ks = {1: [], 5: [], 10: [], 25: [], 50: []}
+    max_k = 50
+
+    for batch_start in range(0, len(val_queries), batch_size):
+        batch = val_queries[batch_start : batch_start + batch_size]
+        images = [Image.open(q["image_path"]).convert("RGB") for q in batch]
+        texts = [q["modification_text"] for q in batch]
+
+        embeddings = raw_model.forward(
+            images=images, text=texts, processor=processor
+        )  # (B, K, P)
+        embeddings = F.normalize(embeddings.float(), dim=-1)
+
+        # learned_router aggregation — matches training
+        query_summary = embeddings.mean(dim=1)  # (B, P)
+        probe_logits = raw_model.probe_router(query_summary)  # (B, K)
+        probe_weights = torch.softmax(probe_logits / probe_temp, dim=1)  # (B, K)
+        best_emb = torch.einsum("bk,bkp->bp", probe_weights, embeddings)  # (B, P)
+        best_emb = F.normalize(best_emb, dim=-1)
+        sims = best_emb @ gallery_embs.T  # (B, N)
+
+        for i, q in enumerate(batch):
+            gt_ids = set(q["gt_img_ids"])
+            top_idx = sims[i].topk(max_k).indices.cpu().tolist()
+            top_coco = [coco_ids[j] for j in top_idx]
+
+            # AP@k: accumulate hits up to k, normalise by min(|GT|, k)
+            hits = 0
+            precision_sum = 0.0
+            for rank, cid in enumerate(top_coco, 1):
+                if cid in gt_ids:
+                    hits += 1
+                    precision_sum += hits / rank
+                if rank in ap_ks:
+                    ap_ks[rank].append(precision_sum / min(len(gt_ids), rank))
+
+            # Recall@k
+            for k in recall_ks:
+                recall_ks[k].append(float(any(c in gt_ids for c in top_coco[:k])))
+
+    raw_model.train()
+
+    n = len(ap_ks[5])
+    metrics = {}
+    for k, vals in ap_ks.items():
+        metrics[f"val/mAP@{k}"] = sum(vals) / n
+    for k, vals in recall_ks.items():
+        metrics[f"val/R@{k}"] = sum(vals) / n
+    return metrics
 
 
 class GatherLayer(torch.autograd.Function):
@@ -33,7 +100,11 @@ def gather_with_grad(x):
 
     Falls back to a no-op on single-GPU runs where dist is not initialised.
     """
-    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+    if (
+        not dist.is_available()
+        or not dist.is_initialized()
+        or dist.get_world_size() == 1
+    ):
         return x
     return torch.cat(GatherLayer.apply(x), dim=0)
 
@@ -58,17 +129,17 @@ class NegativeQueue:
         N = embeddings.shape[0]
         emb = embeddings.detach()
         if N >= self.queue_size:
-            self.buffer.copy_(emb[-self.queue_size:])
+            self.buffer.copy_(emb[-self.queue_size :])
             self.ptr = 0
             self.filled = self.queue_size
             return
         end = self.ptr + N
         if end <= self.queue_size:
-            self.buffer[self.ptr:end].copy_(emb)
+            self.buffer[self.ptr : end].copy_(emb)
         else:
             split = self.queue_size - self.ptr
-            self.buffer[self.ptr:].copy_(emb[:split])
-            self.buffer[:end - self.queue_size].copy_(emb[split:])
+            self.buffer[self.ptr :].copy_(emb[:split])
+            self.buffer[: end - self.queue_size].copy_(emb[split:])
         self.ptr = end % self.queue_size
         self.filled = min(self.filled + N, self.queue_size)
 
@@ -76,7 +147,7 @@ class NegativeQueue:
         """Return all valid embeddings currently in the queue."""
         if self.filled == self.queue_size:
             return self.buffer.clone()
-        return self.buffer[:self.filled].clone()
+        return self.buffer[: self.filled].clone()
 
     def __len__(self) -> int:
         return self.filled
@@ -121,23 +192,25 @@ def hard_infonce_loss(
         tp_mask[torch.arange(B), torch.arange(B)] = True
         mining_sims = sims.masked_fill(tp_mask, float("-inf"))
 
-        _, hard_idx = mining_sims.topk(k_hard, dim=1)              # (B, k_hard)
-        hard_negs = neg_pool[hard_idx]                               # (B, k_hard, P)
+        _, hard_idx = mining_sims.topk(k_hard, dim=1)  # (B, k_hard)
+        hard_negs = neg_pool[hard_idx]  # (B, k_hard, P)
 
-        pos_sim = (query_emb * target_emb).sum(dim=-1, keepdim=True) / temp   # (B, 1)
-        hard_sim = torch.bmm(hard_negs, query_emb.unsqueeze(-1)).squeeze(-1) / temp  # (B, k_hard)
+        pos_sim = (query_emb * target_emb).sum(dim=-1, keepdim=True) / temp  # (B, 1)
+        hard_sim = (
+            torch.bmm(hard_negs, query_emb.unsqueeze(-1)).squeeze(-1) / temp
+        )  # (B, k_hard)
 
-        logits_q2t = torch.cat([pos_sim, hard_sim], dim=1)          # (B, 1+k_hard)
+        logits_q2t = torch.cat([pos_sim, hard_sim], dim=1)  # (B, 1+k_hard)
         labels_q2t = torch.zeros(B, dtype=torch.long, device=query_emb.device)
     else:
         # Standard InfoNCE over full pool (k_hard=0 or pool too small)
-        logits_q2t = sims / temp                                     # (B, M)
+        logits_q2t = sims / temp  # (B, M)
         labels_q2t = torch.arange(B, device=query_emb.device)
 
     loss_q2t = F.cross_entropy(logits_q2t, labels_q2t)
 
     # --- target → query (current batch only) ---
-    logits_t2q = torch.matmul(target_emb, query_emb.T) / temp       # (B, B)
+    logits_t2q = torch.matmul(target_emb, query_emb.T) / temp  # (B, B)
     labels_t2q = torch.arange(B, device=query_emb.device)
     loss_t2q = F.cross_entropy(logits_t2q, labels_t2q)
 

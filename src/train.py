@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 import wandb
 from accelerate import Accelerator
-from PIL import Image
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -27,6 +26,7 @@ from utils import (
     hard_infonce_loss,
     log_vram,
     param_summary,
+    run_circo_val,
     save_checkpoint,
 )
 
@@ -35,61 +35,6 @@ CHECKPOINT_DIR = "./checkpoints"
 
 # Tell PyTorch's allocator to use expandable segments to reduce fragmentation.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
-
-@torch.no_grad()
-def run_circo_val(raw_model, processor, gallery_embs, coco_ids, val_queries, device, probe_temp=0.1, batch_size=4):
-    """Evaluate on CIRCO val split. Returns mAP@{5,10,25,50}, R@{1,5,10,25,50}."""
-    raw_model.eval()
-
-    ap_ks = {5: [], 10: [], 25: [], 50: []}
-    recall_ks = {1: [], 5: [], 10: [], 25: [], 50: []}
-    max_k = 50
-
-    for batch_start in range(0, len(val_queries), batch_size):
-        batch = val_queries[batch_start : batch_start + batch_size]
-        images = [Image.open(q["image_path"]).convert("RGB") for q in batch]
-        texts = [q["modification_text"] for q in batch]
-
-        embeddings = raw_model.forward(images=images, text=texts, processor=processor)  # (B, K, P)
-        embeddings = F.normalize(embeddings.float(), dim=-1)
-
-        # learned_router aggregation — matches training
-        query_summary = embeddings.mean(dim=1)  # (B, P)
-        probe_logits = raw_model.probe_router(query_summary)  # (B, K)
-        probe_weights = torch.softmax(probe_logits / probe_temp, dim=1)  # (B, K)
-        best_emb = torch.einsum("bk,bkp->bp", probe_weights, embeddings)  # (B, P)
-        best_emb = F.normalize(best_emb, dim=-1)
-        sims = best_emb @ gallery_embs.T  # (B, N)
-
-        for i, q in enumerate(batch):
-            gt_ids = set(q["gt_img_ids"])
-            top_idx = sims[i].topk(max_k).indices.cpu().tolist()
-            top_coco = [coco_ids[j] for j in top_idx]
-
-            # AP@k: accumulate hits up to k, normalise by min(|GT|, k)
-            hits = 0
-            precision_sum = 0.0
-            for rank, cid in enumerate(top_coco, 1):
-                if cid in gt_ids:
-                    hits += 1
-                    precision_sum += hits / rank
-                if rank in ap_ks:
-                    ap_ks[rank].append(precision_sum / min(len(gt_ids), rank))
-
-            # Recall@k
-            for k in recall_ks:
-                recall_ks[k].append(float(any(c in gt_ids for c in top_coco[:k])))
-
-    raw_model.train()
-
-    n = len(ap_ks[5])
-    metrics = {}
-    for k, vals in ap_ks.items():
-        metrics[f"val/mAP@{k}"] = sum(vals) / n
-    for k, vals in recall_ks.items():
-        metrics[f"val/R@{k}"] = sum(vals) / n
-    return metrics
 
 
 def main():
@@ -124,12 +69,12 @@ def main():
     NUM_WORKERS = int(os.getenv("NUM_WORKERS", 8))
     NUM_BATCHES = int(os.getenv("NUM_BATCHES", (1024 * 128) // BATCH_SIZE))
 
-    QUEUE_SIZE = int(os.getenv("QUEUE_SIZE", 4096))   # negatives stored in queue
-    K_HARD = int(os.getenv("K_HARD", 64))             # hard negatives per query (0=disabled)
+    QUEUE_SIZE = int(os.getenv("QUEUE_SIZE", 4096))  # negatives stored in queue
+    K_HARD = int(os.getenv("K_HARD", 64))  # hard negatives per query (0=disabled)
 
     VAL_INTERVAL = int(os.getenv("VAL_INTERVAL", 500))
     CIRCO_VAL_ANNOTATIONS = os.getenv("CIRCO_VAL_ANNOTATIONS")  # path to val.json
-    CIRCO_COCO_IMG_DIR = os.getenv("CIRCO_COCO_IMG_DIR")        # path to unlabeled2017/
+    CIRCO_COCO_IMG_DIR = os.getenv("CIRCO_COCO_IMG_DIR")  # path to unlabeled2017/
     CIRCO_GALLERY_CACHE = os.getenv(
         "CIRCO_GALLERY_CACHE",
         "/home/anirban/anishc/CoLLM-implementation-pytorch/clip_unlabeled2017_cache.pt",
@@ -316,7 +261,8 @@ def main():
             LOGGER.info("Gallery loaded: %d images", len(coco_ids_val))
         else:
             LOGGER.warning(
-                "CIRCO_GALLERY_CACHE not found at %s — skipping validation", CIRCO_GALLERY_CACHE
+                "CIRCO_GALLERY_CACHE not found at %s — skipping validation",
+                CIRCO_GALLERY_CACHE,
             )
 
         if gallery_embs_val is not None and os.path.exists(CIRCO_VAL_ANNOTATIONS):
@@ -325,16 +271,23 @@ def main():
             val_queries = [
                 {
                     "query_id": str(ann["id"]),
-                    "image_path": os.path.join(CIRCO_COCO_IMG_DIR, f"{ann['reference_img_id']:012d}.jpg"),
+                    "image_path": os.path.join(
+                        CIRCO_COCO_IMG_DIR, f"{ann['reference_img_id']:012d}.jpg"
+                    ),
                     "modification_text": ann["relative_caption"],
                     "gt_img_ids": ann["gt_img_ids"],
                 }
                 for ann in annotations
             ]
-            LOGGER.info("CIRCO val: %d queries loaded from %s", len(val_queries), CIRCO_VAL_ANNOTATIONS)
+            LOGGER.info(
+                "CIRCO val: %d queries loaded from %s",
+                len(val_queries),
+                CIRCO_VAL_ANNOTATIONS,
+            )
         elif gallery_embs_val is not None:
             LOGGER.warning(
-                "CIRCO_VAL_ANNOTATIONS not found at %s — skipping validation", CIRCO_VAL_ANNOTATIONS
+                "CIRCO_VAL_ANNOTATIONS not found at %s — skipping validation",
+                CIRCO_VAL_ANNOTATIONS,
             )
 
     LOGGER.info("Starting training for %d epoch(s)", EPOCHS)
@@ -396,7 +349,13 @@ def main():
 
                 # Guard: skip batch if backbone produced inf/nan hidden states.
                 # This can happen early in training when fp16 attention overflows.
-                if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+                # Synchronize the decision across all ranks: if any rank sees bad
+                # embeddings, all ranks must skip together to avoid hanging at the
+                # subsequent all_gather collectives (gather_with_grad / accelerator.gather).
+                has_bad = torch.isnan(embeddings).any() or torch.isinf(embeddings).any()
+                bad_flag = torch.tensor(float(has_bad), device=device)
+                dist.all_reduce(bad_flag, op=dist.ReduceOp.MAX)
+                if bad_flag.item() > 0:
                     skipped += 1
                     LOGGER.warning(
                         "Epoch=%d batch=%d | bad embeddings (nan/inf), skipping "
@@ -439,7 +398,7 @@ def main():
                 # full batch as negatives (B*num_gpus negatives per query).
                 # GatherLayer preserves gradient flow to the local process's slice.
                 # target_emb has no grad (frozen CLIP), so plain gather suffices.
-                all_best_emb = gather_with_grad(best_emb)        # (B*N, P)
+                all_best_emb = gather_with_grad(best_emb)  # (B*N, P)
                 all_target_emb = accelerator.gather(target_emb)  # (B*N, P)
 
                 queue_emb = neg_queue.get() if len(neg_queue) > 0 else None
@@ -468,13 +427,23 @@ def main():
                 infonce = hard_infonce_loss(
                     all_best_emb, all_target_emb, INFONCE_TEMP, K_HARD, queue_emb
                 )
-                loss = infonce + DIVERSITY_WEIGHT * (diversity_loss + output_diversity_loss)
+                loss = infonce + DIVERSITY_WEIGHT * (
+                    diversity_loss + output_diversity_loss
+                )
 
             # backward pass — del after backward so the autograd graph is released
             accelerator.backward(loss)
             loss_val = loss.item()
             neg_queue.enqueue(all_target_emb)  # grow negative pool for future batches
-            del target_emb, best_emb, all_best_emb, all_target_emb, all_embeddings, embeddings, loss
+            del (
+                target_emb,
+                best_emb,
+                all_best_emb,
+                all_target_emb,
+                all_embeddings,
+                embeddings,
+                loss,
+            )
             accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
@@ -495,11 +464,20 @@ def main():
             # ----------------------------------------------------------
             # Periodic CIRCO validation (every VAL_INTERVAL batches)
             # ----------------------------------------------------------
-            if (batch_idx + 1) % VAL_INTERVAL == 0 and accelerator.is_main_process and val_queries is not None:
+            if (
+                (batch_idx + 1) % VAL_INTERVAL == 0
+                and accelerator.is_main_process
+                and val_queries is not None
+            ):
                 LOGGER.info("Running CIRCO validation at batch %d...", batch_idx + 1)
                 val_metrics = run_circo_val(
-                    raw_model, processor, gallery_embs_val, coco_ids_val,
-                    val_queries, device, probe_temp=0.1,
+                    raw_model,
+                    processor,
+                    gallery_embs_val,
+                    coco_ids_val,
+                    val_queries,
+                    device,
+                    probe_temp=0.1,
                 )
                 run.log({"batch_idx": batch_idx + 1, **val_metrics})
                 LOGGER.info(
