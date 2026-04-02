@@ -61,7 +61,7 @@ export DIVERSITY_WEIGHT=0.1
 export QUEUE_SIZE=4096
 export K_HARD=64
 
-export VAL_INTERVAL=500
+export VAL_INTERVAL=200
 export CIRCO_VAL_ANNOTATIONS=~/CIRCO/annotations/val.json
 export CIRCO_COCO_IMG_DIR=~/CIRCO/COCO2017_unlabeled/unlabeled2017
 export CIRCO_GALLERY_CACHE=~/CoLLM-implementation-pytorch/clip_unlabeled2017_cache.pt

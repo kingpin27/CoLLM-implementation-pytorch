@@ -68,7 +68,7 @@ def main():
     QUEUE_SIZE = int(os.getenv("QUEUE_SIZE", 4096))  # negatives stored in queue
     K_HARD = int(os.getenv("K_HARD", 64))  # hard negatives per query (0=disabled)
 
-    VAL_INTERVAL = int(os.getenv("VAL_INTERVAL", 500))
+    VAL_INTERVAL = int(os.getenv("VAL_INTERVAL", 200))
     CIRCO_VAL_ANNOTATIONS = os.getenv("CIRCO_VAL_ANNOTATIONS")  # path to val.json
     CIRCO_COCO_IMG_DIR = os.getenv("CIRCO_COCO_IMG_DIR")  # path to unlabeled2017/
     CIRCO_GALLERY_CACHE = os.getenv(
