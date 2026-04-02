@@ -56,24 +56,24 @@ Training runs in conda env `collm5` with CUDA 12.4. Credentials loaded from `.se
 - **Pruned language model**: truncated to `KEEP_LAYERS=16` (from 32) to reduce memory
 - **Learnable `cls_probes`**: shape `(K=4, H=1024)` — K probe vectors attending over the LM output sequence
 - **`probe_proj`**: `Linear(H=1024, P=512)` — projects pooled features into CLIP embedding space (P=512 matches CLIP-B/32)
-- **`probe_router`**: `Linear(P=512, K=4)` — computes soft routing weights over probes
 
-**Forward pass**: image+text → Qwen backbone → multi-head attention pooling with each probe attending to the full sequence → project to CLIP space → L2 normalize → weighted sum via probe router.
+**Forward pass**: image+text → Qwen backbone → multi-head attention pooling with each probe attending to the full sequence → project to CLIP space → L2 normalize → return all K embeddings directly (no routing/weighting).
 
 ### Training (`src/train.py`)
 
-**Loss**: symmetric InfoNCE between query embeddings (CoLLM output) and target embeddings (pre-computed frozen CLIP vectors). Multi-GPU negatives are gathered via `GatherLayer` to maximize batch size of negatives.
+**Loss**: multiprobe set-based symmetric InfoNCE (`multiprobe_infonce_loss`) between query embeddings (CoLLM output, K embeddings per query) and target embeddings (pre-computed frozen CLIP vectors). Multi-GPU negatives are gathered via `GatherLayer` to maximize batch size of negatives.
 
-**Probe temperature annealing**: `PROBE_TEMP` decays exponentially from 1.0 → 0.1 over training, annealing the soft routing toward hard probe selection.
+**Hard negative mining**: FIFO queue (`NegativeQueue`, size 4096) stores past target embeddings; top-`K_HARD=64` hardest negatives per query are mixed into the InfoNCE loss.
 
-**Output diversity loss**: regularization term (`DIVERSITY_WEIGHT=0.1`) penalizes collapsed probe routing.
+**Output diversity loss**: regularization term (`DIVERSITY_WEIGHT=0.1`) penalizes collapsed probes via gram matrix of both probe weights and output embeddings.
 
 **Validation**: runs CIRCO val every `VAL_INTERVAL=500` batches computing mAP@{5,10,25,50} and R@{1,5,10,25,50}.
 
 Key env vars controlling training (all have defaults in `train.py`):
 - `PROJ_DIM=512`, `NUM_EMBS=4`, `HID_DIM=1024`, `KEEP_LAYERS=16`
 - `BATCH_SIZE=32` (per GPU), `NUM_BATCHES=16384`
-- `INFONCE_TEMP=0.07`, `DIVERSITY_WEIGHT=0.1`, `PROBE_TEMP` (start), `PROBE_TEMP_END`
+- `INFONCE_TEMP=0.1`, `DIVERSITY_WEIGHT=0.1`
+- `QUEUE_SIZE=4096`, `K_HARD=64` (set to 0 to disable hard negatives)
 - `EXPERIMENT_ID`: used for checkpoint naming and W&B run grouping
 
 ### Data Pipeline (`src/dataset.py`)

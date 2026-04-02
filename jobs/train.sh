@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=train_collm
-#SBATCH --partition=ada
+#SBATCH --partition=a100
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
