@@ -51,15 +51,16 @@ export HID_DIM=1024
 export KEEP_LAYERS=16
 
 export EPOCHS=1
-export BATCH_SIZE=32
+export BATCH_SIZE=50
 export NUM_WORKERS=4
-export NUM_BATCHES=$(( (1024 * 512) / BATCH_SIZE ))
+export NUM_BATCHES=16384
 
+export PROBE_TEMP=1.0
 export INFONCE_TEMP=0.07
 export DIVERSITY_WEIGHT=0.1
 
-export QUEUE_SIZE=4096
-export K_HARD=64
+export QUEUE_SIZE=4000
+export K_HARD=100
 
 export VAL_INTERVAL=200
 export CIRCO_VAL_ANNOTATIONS=~/CIRCO/annotations/val.json
